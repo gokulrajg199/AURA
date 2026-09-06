@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.next/
+node_modules/
+*.log
+backend/data/projects.json
+backend/data/project_workspaces/*
+!backend/data/project_workspaces/.gitkeep

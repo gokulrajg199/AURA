@@ -1,0 +1,24 @@
+[PASS] health
+[PASS] pipeline
+[PASS] stages
+[PASS] capabilities
+[PASS] project creation
+[PASS] project get
+[PASS] project status
+[PASS] intelligence
+[PASS] results before execution
+[PASS] real workspace build
+[PASS] controlled smoke execution
+[PASS] missing dataset is blocked
+[PASS] results observatory truth boundary
+[PASS] deliverable report
+[PASS] deliverable paper
+[PASS] deliverable presentation
+[PASS] deliverable sih
+[PASS] deliverable demo
+[PASS] deliverable viva
+[PASS] deliverable pdf
+[PASS] deliverable text
+[PASS] project package
+
+22/22 checks passed
