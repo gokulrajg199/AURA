@@ -129,7 +129,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in os.getenv(
         "AURA_CORS_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000",
+        "https://aura-frontend-rvbn.onrender.com,http://localhost:3000,http://127.0.0.1:3000",
     ).split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
@@ -172,6 +172,9 @@ def _save_project_store() -> None:
         snap = project_snapshot(project)
         lifecycle = snap.get("lifecycle") or build_lifecycle(snap, list_executions(project_id))
         propagate_dependency_impact(snap)
+        # Dependency invalidation can change completion; recompute it before persistence.
+        project.completion = evaluate_completion(snap, list_executions(project_id))
+        snap["completion"] = project.completion
         # Mirror deterministic impact/validation changes back into the Pydantic model before persistence.
         project.project_context = snap.get("project_context", {})
         project.validation = snap.get("validation", project.validation)
