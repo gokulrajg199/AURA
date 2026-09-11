@@ -1,11 +1,33 @@
+# Python
 __pycache__/
 *.py[cod]
+*.pyo
+.pytest_cache/
 .venv/
 venv/
+
+# Environment / secrets
 .env
-.next/
-node_modules/
-*.log
-backend/data/projects.json
-backend/data/project_workspaces/*
-!backend/data/project_workspaces/.gitkeep
+.env.*
+!.env.example
+
+# Runtime data
+backend/data/*.db
+backend/data/*.json
+backend/data/project_workspaces/
+backend/data/uploads/
+
+# Node / Next
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# TypeScript generated build metadata
+tsconfig.tsbuildinfo

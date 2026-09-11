@@ -1,25 +1,68 @@
-# AURA — Integrated Project Intelligence + Execution + Results Engine
+# AURA 6.1 — Complete AI Research, Innovation & Development Operating System
 
-This build connects AURA's evidence graph to a controlled real-project workspace and a measured-results layer.
+AURA is an evidence-driven project intelligence and development operating system that connects idea understanding, research, evidence, decisions, innovation, architecture, implementation, data, experiments, results, validation and delivery.
 
-## Execution lifecycle
+## One system
+`IDEA → ANALYSIS → REQUIREMENTS → RESEARCH → EVIDENCE → INNOVATION → SOLUTION → ARCHITECTURE → IMPLEMENTATION → DATASET → BASELINE → MODEL → TESTING → EXPERIMENT → RESULTS → VALIDATION → DOCUMENTATION → DELIVERY → COMPLETED`
 
-IDEA → RESEARCH → EVIDENCE → CLAIMS → FINDINGS → VERDICT → INNOVATION → SOLUTION → ARCHITECTURE → BUILD → DATASET → BASELINE → PROPOSED MODEL → EVALUATION → EXPERIMENT → RESULTS → VALIDATION → DELIVERY
+## AURA Journey
+`UNDERSTAND → INVESTIGATE → ANALYZE → VERDICT → INNOVATE → SOLUTION → ARCHITECT → BUILD → EXPERIMENT → VALIDATE → DELIVER`
 
-## Results truth
+## 6.1 capabilities
+- Dynamic project analyzer and capability contract
+- Research/literature intelligence and research-gap analysis
+- Evidence and claims with provenance/review truth boundary
+- Project provenance graph
+- Dynamic project-development lifecycle
+- Real workspace generation and allowlisted execution
+- Dataset upload, safe extraction, hashing and profiling
+- Baseline/proposed experiment planning and comparison
+- Artifact-driven results collection
+- Human + evidence validation gate
+- Strict Completion Engine 2.0
+- Specialist-agent orchestration
+- Authentication, roles, collaboration, tasks, comments and audit trail
+- Version checkpoints and reproducibility manifests
+- Project health scoring
+- One-click delivery package and generated reports
+- Cinematic Command Center UI
+- 14-chapter complete project report generation
+- Dataset, results, experiment, traceability and completion report outputs
 
-AURA never fabricates performance. Baseline and proposed metrics appear only when an approved dataset/model is actually executed. If a baseline is unavailable, the comparison remains unmeasured rather than using an estimate.
+## Truth boundary
+AURA deliberately enforces:
 
-## New result layer
+`GENERATED ≠ IMPLEMENTED ≠ TESTED ≠ EXECUTED ≠ MEASURED ≠ VALIDATED ≠ COMPLETED`
 
-- `backend/services/results_engine.py`
-- `GET /api/aura/projects/{project_id}/results`
-- baseline evaluation support via `models/baseline.pt`
-- proposed evaluation via executed training weights
-- metric comparison: mAP50, mAP50-95, precision, recall
-- persisted `artifacts/results_summary.json`
-- frontend Results Observatory
+The platform can be certified complete as software, but it must never invent an end-user project's scientific dataset, measured metrics, validation or human approval.
 
-## Scientific boundary
+## Start locally
+### Backend
+```powershell
+cd backend
+python -m pip install -r requirements.txt
+python -m uvicorn main:app --reload --port 8000
+```
 
-Execution is not automatically scientific validation. Measured results require human/scientific review before being treated as validated findings or publication claims.
+### Frontend
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`.
+
+## Production
+- Backend: Python/FastAPI service.
+- Database: PostgreSQL using `AURA_DATABASE_URL`.
+- Frontend: Next.js using `NEXT_PUBLIC_AURA_API_URL`.
+- Store large datasets/models/artifacts in durable object storage or persistent volumes.
+- Set a strong `AURA_AUTH_SECRET`.
+
+## Verification
+Run:
+```powershell
+python VERIFY_AURA_6_1.py
+```
+The release verification checks source completeness, backend compilation, platform certification and live API endpoints.

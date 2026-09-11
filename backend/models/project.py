@@ -6,6 +6,8 @@ class AURAProject(BaseModel):
     project_id: str
     project_name: str
     original_idea: str
+    owner_id: int | None = None
+    owner_email: str | None = None
 
     status: str = "created"
     current_stage: str = "understand"
@@ -25,5 +27,13 @@ class AURAProject(BaseModel):
     validation: dict[str, Any] = Field(default_factory=dict)
     deliverables: dict[str, Any] = Field(default_factory=dict)
 
+    # Persisted Project Twin/context cache. It is refreshed from the canonical
+    # project snapshot and never treated as independent scientific evidence.
+    project_twin: dict[str, Any] = Field(default_factory=dict)
+    project_context: dict[str, Any] = Field(default_factory=dict)
+
     memory: list[dict[str, Any]] = Field(default_factory=list)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
+    execution_contract: dict[str, Any] = Field(default_factory=dict)
+    completion: dict[str, Any] = Field(default_factory=dict)
+    audit_log: list[dict[str, Any]] = Field(default_factory=list)

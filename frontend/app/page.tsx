@@ -4,6 +4,26 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_AURA_API_URL || "http://127.0.0.1:8000";
 
+async function auraFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers || {});
+  if (!headers.has("Authorization")) {
+    try {
+      const raw = window.localStorage.getItem("aura_session");
+      if (raw) {
+        const session = JSON.parse(raw) as { token?: string };
+        if (session.token) headers.set("Authorization", `Bearer ${session.token}`);
+      }
+    } catch {
+      // Ignore malformed browser session state; the backend will reject protected requests.
+    }
+  }
+  const response = await fetch(input, { ...init, headers });
+  if (response.status === 401) throw new Error("Your AURA session is no longer valid. Please sign in again.");
+  if (response.status === 403) throw new Error("You do not have access to this AURA project.");
+  return response;
+}
+
+
 const STAGES = [
   "understand",
   "investigate",
@@ -74,6 +94,8 @@ const STAGE_ICONS: Record<string, string> = {
 type Project = {
   project_id?: string;
   project_name?: string;
+  owner_id?: number | null;
+  owner_email?: string | null;
   original_idea?: string;
   status?: string;
   current_stage?: string;
@@ -92,6 +114,30 @@ type Project = {
   deliverables?: Record<string, unknown>;
   memory?: unknown[];
   evidence?: unknown[];
+  lifecycle?: Lifecycle;
+  completion?: Record<string, unknown>;
+};
+
+type LifecycleStage = {
+  key: string;
+  label: string;
+  order: number;
+  status: string;
+  display: string;
+  reason: string;
+  description: string;
+  verified: boolean;
+};
+
+type Lifecycle = {
+  profile?: string;
+  stages?: LifecycleStage[];
+  total_stages?: number;
+  verified_stages?: number;
+  completion_percent?: number;
+  completed?: boolean;
+  next_blocker?: LifecycleStage | null;
+  truth?: string;
 };
 
 type Pipeline = {
@@ -116,6 +162,8 @@ type BackendResponse = {
   pipeline?: Pipeline;
   project_id?: string;
   project_name?: string;
+  owner_id?: number | null;
+  owner_email?: string | null;
   original_idea?: string;
   status?: string;
   current_stage?: string;
@@ -163,6 +211,55 @@ function humanizeKey(value: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function getTruthStatus(project: Project | null): { label: string; detail: string; tone: "good" | "warning" | "neutral" } {
+  const validation = isRecord(project?.validation) ? project.validation : {};
+  const experiments = isRecord(project?.experiments) ? project.experiments : {};
+  const results = isRecord(experiments.results_summary) ? experiments.results_summary : {};
+  const verified = validation.scientific_validation === true || validation.results_verified === true || results.scientific_validation === true;
+  const resultStatus = safeText(results.status).toUpperCase();
+  const executionStatus = safeText(validation.execution_status || experiments.execution_status).toUpperCase();
+  const successfulExecution = ["EXECUTED", "RESULTS_AVAILABLE_REVIEW_REQUIRED", "EXPERIMENT_EXECUTED_REVIEW_REQUIRED"].includes(resultStatus) || executionStatus === "EXECUTED";
+  const blockedExecution = ["BLOCKED", "BLOCKED_OR_FAILED", "FAILED"].includes(resultStatus) || ["BLOCKED", "BLOCKED_OR_FAILED", "FAILED"].includes(executionStatus);
+  if (verified) return { label: "VALIDATED", detail: "Measured execution evidence has been reviewed and scientifically approved.", tone: "good" };
+  if (blockedExecution && !successfulExecution) return { label: "EXECUTION BLOCKED", detail: "A controlled execution was attempted but a required project input or prerequisite is missing.", tone: "warning" };
+  if (successfulExecution) return { label: "EXECUTION RECORDED", detail: "Controlled execution is recorded; measured evidence still requires scientific review.", tone: "warning" };
+  return { label: "DESIGNED • NOT EXECUTED", detail: "Blueprint and workflow are prepared; measured results do not yet exist.", tone: "warning" };
+}
+
+function getStageState(stage: string, index: number, pipeline: Pipeline | null, project: Project | null): { status: string; label: string } {
+  if (!project) return { status: "pending", label: "PENDING" };
+  const truth = getTruthStatus(project);
+  const validation = isRecord(project.validation) ? project.validation : {};
+  const experiments = isRecord(project.experiments) ? project.experiments : {};
+  const results = isRecord(experiments.results_summary) ? experiments.results_summary : {};
+  const validated = validation.scientific_validation === true || validation.results_verified === true;
+  const experimentExecuted = ["RESULTS_AVAILABLE_REVIEW_REQUIRED", "EXPERIMENT_EXECUTED_REVIEW_REQUIRED"].includes(safeText(results.status).toUpperCase());
+  const executionBlocked = truth.label === "EXECUTION BLOCKED";
+  if (index <= 2) return { status: "completed", label: "COMPLETED" };
+  if (stage === "aura_verdict") return { status: "completed", label: "GENERATED" };
+  if (stage === "innovate") return { status: "completed", label: "GENERATED" };
+  if (stage === "solution" || stage === "architect") return { status: "completed", label: "DESIGNED" };
+  if (stage === "build") return { status: "ready", label: "READY" };
+  if (stage === "experiment") {
+    if (experimentExecuted) return { status: "completed", label: "EXECUTED" };
+    if (executionBlocked) return { status: "blocked", label: "BLOCKED" };
+    return { status: "pending", label: "AWAITING EXECUTION" };
+  }
+  if (stage === "validate") return validated ? { status: "completed", label: "VERIFIED" } : { status: "blocked", label: "REVIEW REQUIRED" };
+  if (stage === "deliver") return validated ? { status: "ready", label: "READY" } : { status: "pending", label: "PENDING" };
+  return { status: "pending", label: "PENDING" };
+}
+
+function BlueprintValue({ value }: { value: unknown }) {
+  if (Array.isArray(value)) {
+    return <ul className="aura20-blueprint-list">{value.map((item, i) => <li key={i}><span>✦</span><BlueprintValue value={item} /></li>)}</ul>;
+  }
+  if (isRecord(value)) {
+    return <div className="aura20-blueprint-object">{Object.entries(value).map(([key, item]) => <div className="aura20-blueprint-field" key={key}><div className="aura20-blueprint-field-label">{humanizeKey(key)}</div><BlueprintValue value={item} /></div>)}</div>;
+  }
+  return <span>{String(value ?? "—")}</span>;
 }
 
 function cleanText(value: unknown): string {
@@ -1021,7 +1118,7 @@ function getProjectTruthStatus(project: Project | null): { label: string; detail
   const verified = validation.results_verified === true || results.verified === true;
   const executed = safeText(validation.execution_status || experiments.execution_status).toLowerCase().includes("execut");
   if (verified) return { label: "PROJECT VALIDATED", detail: "Execution and results have been recorded and marked for scientific review." };
-  if (executed) return { label: "EXECUTION RECORDED", detail: "The AURA workflow is complete, but scientific validation is still pending review." };
+  if (executed) return { label: "EXECUTION RECORDED", detail: "Controlled execution has been recorded; scientific validation is still pending review." };
   if (project?.status === "completed") return { label: "WORKFLOW COMPLETE", detail: "All AURA reasoning stages are complete; the actual project still requires execution and validation." };
   return { label: "PROJECT IN PROGRESS", detail: "AURA is still building or evaluating the project." };
 }
@@ -1194,7 +1291,7 @@ function LoginScreen({
           </button>
 
           <div className="login-trust">
-            <span>●</span> Guest mode creates a temporary local workspace. Connect real authentication later for cloud persistence.
+            <span>●</span> Guest mode is local-only. Email/password accounts use AURA backend authentication; cloud persistence still requires production storage.
           </div>
         </div>
       </section>
@@ -1236,14 +1333,15 @@ function ProjectDashboard({
         {projects.slice(0, 6).map((saved) => {
           const item = saved.project;
           const stageIndex = Math.max(0, STAGES.indexOf(item.current_stage || "understand"));
-          const complete = item.status === "completed" || item.status === "delivery_ready";
-          const progress = complete ? 100 : Math.round((stageIndex / STAGES.length) * 100);
+          const truth = getTruthStatus(item);
+          const scientificallyValidated = truth.label === "VALIDATED";
+          const progress = scientificallyValidated ? 100 : Math.round((stageIndex / STAGES.length) * 100);
           return (
             <article className="saved-project-card" key={item.project_id || item.project_name}>
               <div className="saved-project-top">
                 <span className="saved-project-icon">A</span>
-                <span className={"saved-project-status " + (complete ? "complete" : "active")}>
-                  {complete ? "COMPLETED" : formatStatus(item.status || "processing")}
+                <span className={"saved-project-status " + (scientificallyValidated ? "complete" : "active")}>
+                  {scientificallyValidated ? "SCIENTIFICALLY VALIDATED" : truth.label}
                 </span>
               </div>
               <h3>{item.project_name || "Untitled AURA Project"}</h3>
@@ -1276,6 +1374,8 @@ export default function Home() {
   const [authError, setAuthError] = useState("");
   const [userName, setUserName] = useState("Researcher");
   const [userEmail, setUserEmail] = useState("");
+  const [authToken, setAuthToken] = useState("");
+  const [userRole, setUserRole] = useState("researcher");
   const [savedProjects, setSavedProjects] = useState<SavedProject[]>([]);
 
   const [idea, setIdea] = useState("");
@@ -1293,19 +1393,49 @@ export default function Home() {
 
   useEffect(() => {
     checkBackend();
+    let cancelled = false;
     try {
       const saved = window.localStorage.getItem("aura_session");
       if (saved) {
-        const session = JSON.parse(saved) as { authenticated?: boolean; name?: string; email?: string };
+        const session = JSON.parse(saved) as { authenticated?: boolean; name?: string; email?: string; token?: string; role?: string };
         if (session.authenticated) {
           setAuthenticated(true);
           setUserEmail(session.email || "");
           setUserName(session.name || session.email?.split("@")[0] || "Researcher");
+          setAuthToken(session.token || "");
+          setUserRole(session.role || "researcher");
+
+          // Revalidate persisted sessions against the backend before trusting
+          // an old browser token or its cached project snapshots. Guest mode
+          // intentionally has no token and remains local/ownerless.
+          if (session.token) {
+            auraFetch(API_BASE + "/api/aura/auth/me", { cache: "no-store" })
+              .then(async (response) => {
+                if (!response.ok) throw new Error("Session validation failed.");
+                const payload = await response.json().catch(() => ({}));
+                if (cancelled) return;
+                const verified = payload.user || {};
+                const email = verified.email || session.email || "";
+                const name = session.name || email.split("@")[0] || "Researcher";
+                const role = verified.role || session.role || "researcher";
+                saveSession(name, email, session.token || "", role);
+              })
+              .catch(() => {
+                if (cancelled) return;
+                window.localStorage.removeItem("aura_session");
+                setAuthenticated(false);
+                setUserEmail("");
+                setAuthToken("");
+                setUserRole("researcher");
+                setSavedProjects([]);
+              });
+          }
         }
       }
     } catch {
       window.localStorage.removeItem("aura_session");
     }
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -1355,9 +1485,16 @@ export default function Home() {
     setShowWorkspace(true);
     setActiveStage(restored.current_stage && STAGES.includes(restored.current_stage) ? restored.current_stage : "understand");
     setError("");
-    if (restored.project_id && backendOnline) {
-      fetchProject(restored.project_id).catch(() => {
-        // Keep the local project snapshot if the backend no longer has this runtime project.
+    const restoredProjectId = restored.project_id;
+    if (restoredProjectId && backendOnline) {
+      fetchProject(restoredProjectId).catch(() => {
+        // Never keep displaying a cached project after the server rejects it.
+        // This prevents stale/tampered browser snapshots from bypassing the
+        // backend ownership boundary in the UI.
+        setProject(null);
+        setShowWorkspace(false);
+        setError("This project is no longer available to your account.");
+        deleteSavedProject(restoredProjectId);
       });
     }
   }
@@ -1374,48 +1511,52 @@ export default function Home() {
     });
   }
 
-  function saveSession(name: string, email: string) {
+  function saveSession(name: string, email: string, token = "", role = "researcher") {
     const cleanName = name.trim() || email.split("@")[0] || "Researcher";
     setUserName(cleanName);
     setUserEmail(email);
+    setAuthToken(token);
+    setUserRole(role);
     setAuthenticated(true);
     window.localStorage.setItem(
       "aura_session",
-      JSON.stringify({ authenticated: true, name: cleanName, email })
+      JSON.stringify({ authenticated: true, name: cleanName, email, token, role })
     );
     setAuthError("");
   }
 
-  function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const email = authEmail.trim();
     const password = authPassword;
-
-    if (!email || !email.includes("@")) {
-      setAuthError("Enter a valid email address.");
-      return;
-    }
-    if (password.length < 6) {
-      setAuthError("Password must contain at least 6 characters.");
-      return;
-    }
-
-    saveSession(authMode === "create" ? authName : "", email);
+    if (!email || !email.includes("@")) { setAuthError("Enter a valid email address."); return; }
+    if (password.length < 8) { setAuthError("Password must contain at least 8 characters."); return; }
+    try {
+      const endpoint = authMode === "create" ? "/api/aura/auth/register" : "/api/aura/auth/login";
+      const response = await auraFetch(API_BASE + endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password, role: "researcher" }) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || "Authentication failed.");
+      if (authMode === "create") {
+        setAuthMode("login"); setAuthPassword(""); setAuthError("Account created. Please sign in."); return;
+      }
+      saveSession(data.user?.email?.split("@")[0] || "Researcher", data.user?.email || email, data.access_token || "", data.user?.role || "researcher");
+    } catch (e) { setAuthError(e instanceof Error ? e.message : "Authentication failed."); }
   }
 
   function continueWithGoogle() {
-    // Local demo auth. Replace this handler with Google OAuth when a provider is connected.
-    saveSession("Google Researcher", "google-user@aura.local");
+    setAuthError("Google sign-in is not configured. Use email/password or Guest mode.");
   }
 
   function continueAsGuest() {
-    saveSession("Guest Researcher", "guest@aura.local");
+    saveSession("Guest Researcher", "guest@aura.local", "", "researcher");
   }
 
   function logout() {
     window.localStorage.removeItem("aura_session");
     setAuthenticated(false);
     setUserEmail("");
+    setAuthToken("");
+    setUserRole("researcher");
     setSavedProjects([]);
     setAuthEmail("");
     setAuthPassword("");
@@ -1426,7 +1567,7 @@ export default function Home() {
 
   async function checkBackend() {
     try {
-      const response = await fetch(API_BASE + "/health", {
+      const response = await auraFetch(API_BASE + "/health", {
         cache: "no-store",
       });
 
@@ -1474,7 +1615,7 @@ export default function Home() {
 
   async function fetchPipeline() {
     try {
-      const response = await fetch(API_BASE + "/api/aura/pipeline", {
+      const response = await auraFetch(API_BASE + "/api/aura/pipeline", {
         cache: "no-store",
       });
 
@@ -1645,22 +1786,11 @@ export default function Home() {
     STAGES.indexOf(currentStage)
   );
 
-  const completedCount =
-    pipeline?.completed_stages !== undefined
-      ? pipeline.completed_stages
-      : project?.status === "completed" ||
-          project?.status === "delivery_ready"
-        ? STAGES.length
-        : currentStageIndex;
-
-  const progress =
-    pipeline?.progress !== undefined
-      ? pipeline.progress
-      : project
-        ? Math.round(
-            (completedCount / STAGES.length) * 100
-          )
-        : 0;
+  // AURA Journey progress and Project Lifecycle completion are deliberately separate.
+  const stageStates = project ? STAGES.map((stage, index) => getStageState(stage, index, pipeline, project)) : [];
+  const journeyVerifiedCount = stageStates.filter((item) => ["COMPLETED", "EXECUTED", "VERIFIED"].includes(item.label)).length;
+  const progress = project ? Math.round((journeyVerifiedCount / STAGES.length) * 100) : 0;
+  const configuredCount = project ? STAGES.length : 0;
 
   return (
     <main className="aura-app">
@@ -1925,8 +2055,8 @@ export default function Home() {
                     "AURA Project"}
                 </strong>
 
-                <span>
-                  {project?.status || "processing"}
+                <span className="project-truth-badge">
+                  {getTruthStatus(project).label}
                 </span>
               </div>
             </div>
@@ -1934,21 +2064,20 @@ export default function Home() {
             <div className="progress-box">
               <div className="progress-header">
                 <span>PROJECT JOURNEY</span>
-                <strong>{progress}%</strong>
+                <strong>{progress}% VERIFIED PROGRESS</strong>
               </div>
-
-              <div className="progress-track">
-                <div
-                  className="progress-fill"
-                  style={{
-                    width: progress + "%",
-                  }}
-                />
+              <div className="progress-track"><div className="progress-fill" style={{ width: progress + "%" }} /></div>
+              <small>{journeyVerifiedCount} / {STAGES.length} AURA STAGES VERIFIED · {configuredCount} CONFIGURED</small>
+              <div className="truth-status-grid">
+                <div><b>WORKFLOW</b><span>{configuredCount} / {STAGES.length} CONFIGURED</span></div>
+                <div><b>DESIGN</b><span>COMPLETE</span></div>
+                <div><b>RESEARCH</b><span>EVIDENCE REQUIRED</span></div>
+                <div><b>IMPLEMENTATION</b><span>READY</span></div>
+                <div><b>EXPERIMENT</b><span>{getStageState("experiment", 8, pipeline, project).label}</span></div>
+                <div><b>VALIDATION</b><span>{getStageState("validate", 9, pipeline, project).label}</span></div>
+                <div><b>DELIVERY</b><span>{getStageState("deliver", 10, pipeline, project).label}</span></div>
               </div>
-
-              <small>
-                {completedCount} / {STAGES.length} AURA workflow stages complete
-              </small>
+              <div className="scientific-truth-strip"><span>🛡</span><div><b>SCIENTIFIC TRUTH</b><small>NO FABRICATED RESULTS · DESIGNED ≠ EXECUTED ≠ VALIDATED</small></div></div>
             </div>
 
             <div className="sidebar-section">
@@ -1957,12 +2086,8 @@ export default function Home() {
               </div>
 
               {STAGES.map((stage, index) => {
-                const stageStatus =
-                  index < currentStageIndex
-                    ? "completed"
-                    : index === currentStageIndex
-                      ? "running"
-                      : "pending";
+                const stageState = getStageState(stage, index, pipeline, project);
+                const stageStatus = stageState.status;
 
                 return (
                   <button
@@ -1991,12 +2116,9 @@ export default function Home() {
                     </span>
 
                     <span className="stage-marker">
-                      {stageStatus === "completed"
-                        ? "✓"
-                        : stageStatus === "running"
-                          ? "●"
-                          : "○"}
+                      {stageStatus === "completed" ? "✓" : stageStatus === "running" ? "●" : stageStatus === "ready" ? "◐" : stageStatus === "blocked" ? "!" : "○"}
                     </span>
+                    <span className="stage-state-label">{stageState.label}</span>
                   </button>
                 );
               })}
@@ -2033,6 +2155,12 @@ export default function Home() {
                 }
               >
                 ◌ Project Memory
+              </button>
+              <button
+                className={"system-nav " + (activeStage === "aura2" ? "active" : "")}
+                onClick={() => setActiveStage("aura2")}
+              >
+                ✦ AURA 2.0 INTELLIGENCE
               </button>
             </div>
           </aside>
@@ -2072,14 +2200,14 @@ export default function Home() {
         </div>
         <div className="np-track">
           {STAGES.map((item, index) => {
-            const state = pipeline?.stages?.find((entry) => entry.stage === item)?.status || (index < STAGES.indexOf(activeStage) ? "completed" : item === activeStage ? "running" : "queued");
+            const stageState = getStageState(item, index, pipeline, project);
             const active = item === activeStage;
-            const done = state.toLowerCase().includes("complete") || state.toLowerCase().includes("done") || index < STAGES.indexOf(activeStage);
-            return <div className={`np-node ${active ? "active" : ""} ${done ? "done" : ""}`} key={item} onClick={() => setActiveStage(item)}>
+            const done = stageState.status === "completed";
+            return <button type="button" className={`np-node ${active ? "active" : ""} ${done ? "done" : ""}`} key={item} onClick={() => setActiveStage(item)} aria-label={`Open ${LABELS[item]} stage`}>
               <div className="np-orb"><span>{String(index + 1).padStart(2,"0")}</span></div>
               <div className="np-label">{LABELS[item]}</div>
               {index < STAGES.length - 1 && <div className="np-link"><i /></div>}
-            </div>;
+            </button>;
           })}
         </div>
       </div>
@@ -2113,10 +2241,17 @@ export default function Home() {
               })}
             </div>
 
+            <ProjectLifecycle project={project} />
+            <AuraProjectStatusLayer project={project} pipeline={pipeline} />
+            <PlatformCompletionPanel />
+            <ProjectHealthPanel project={project} />
+
             {activeStage === "evidence" ? (
               <EvidencePanel project={project} />
             ) : activeStage === "memory" ? (
               <MemoryPanel project={project} />
+            ) : activeStage === "aura2" ? (
+              <AuraTwoPointZero project={project} idea={idea} projectName={projectName} />
             ) : (
               <StagePanel
                 stage={activeStage}
@@ -2133,7 +2268,7 @@ export default function Home() {
         <span>
           AI RESEARCH • INNOVATION • DEVELOPMENT OS
         </span>
-        <span>CORE v1.0.0</span>
+        <span>CORE v6.1 • AURA 1.0 + INTELLIGENCE 2.0</span>
       </footer>
 
       <style jsx global>{`
@@ -2946,6 +3081,17 @@ export default function Home() {
           letter-spacing: 0.12em;
         }
 
+        .truth-status-grid { display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-top:10px; }
+        .truth-status-grid > div { padding:7px 8px; border:1px solid rgba(119,224,255,.08); border-radius:8px; background:rgba(119,224,255,.025); }
+        .truth-status-grid b, .truth-status-grid span { display:block; }
+        .truth-status-grid b { color:#68798c; font-size:6px; letter-spacing:.12em; }
+        .truth-status-grid span { color:#b7d8e7; font-size:6.5px; margin-top:3px; line-height:1.35; }
+        .scientific-truth-strip { display:flex; gap:8px; align-items:center; margin-top:8px; padding:8px; border:1px solid rgba(255,185,80,.14); border-radius:9px; background:rgba(255,185,80,.035); }
+        .scientific-truth-strip > span { font-size:12px; }
+        .scientific-truth-strip b, .scientific-truth-strip small { display:block; }
+        .scientific-truth-strip b { color:#ffd38a; font-size:6.5px; letter-spacing:.1em; }
+        .scientific-truth-strip small { color:#8f7c62; font-size:5.5px; margin-top:2px; line-height:1.4; }
+
         .progress-box {
           margin: 18px 4px 24px;
           padding: 13px;
@@ -3073,6 +3219,12 @@ export default function Home() {
           text-align: right;
           font-size: 8px;
         }
+
+        .stage-state-label { color:#53667a; font-size:5.5px; letter-spacing:.08em; text-align:right; min-width:38px; }
+        .stage-nav.ready .stage-marker { color:#d7b56b; }
+        .stage-nav.blocked .stage-marker { color:#ff8f8f; }
+        .stage-nav.ready .stage-state-label { color:#c8a866; }
+        .stage-nav.blocked .stage-state-label { color:#d88484; }
 
         .stage-nav.completed .stage-marker {
           color: #27e4ad;
@@ -4149,6 +4301,8 @@ export default function Home() {
           }
         }
 
+        @media (max-width: 900px) { .aura20-status-flow { grid-template-columns:repeat(2,minmax(0,1fr)); } .aura20-truth-heading { align-items:flex-start; flex-direction:column; } .aura20-blueprint-meta { grid-template-columns:1fr; } }
+
         @media (prefers-reduced-motion: reduce) {
           *,
           *::before,
@@ -4444,13 +4598,25 @@ export default function Home() {
 .neural-pipeline{position:relative;margin:0 0 22px;padding:18px 20px 20px;border:1px solid rgba(119,224,255,.16);border-radius:20px;background:linear-gradient(135deg,rgba(7,18,31,.94),rgba(10,15,30,.82));box-shadow:inset 0 1px rgba(255,255,255,.04),0 18px 55px rgba(0,0,0,.22);overflow:hidden}
 .neural-pipeline:before{content:"";position:absolute;inset:0;background-image:linear-gradient(rgba(119,224,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(119,224,255,.035) 1px,transparent 1px);background-size:28px 28px;mask-image:linear-gradient(90deg,transparent,#000 18%,#000 82%,transparent)}
 .np-header{position:relative;z-index:2;display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}.np-kicker{font-size:11px;letter-spacing:.18em;font-weight:800;color:#77e0ff}.np-caption{margin-left:12px;font-size:12px;color:rgba(220,240,255,.48)}.np-live{font-size:10px;letter-spacing:.13em;color:#9dffcb;display:flex;align-items:center;gap:7px}.np-live-dot{width:7px;height:7px;border-radius:50%;background:#8dffc0;box-shadow:0 0 12px #8dffc0;animation:npPulse 1.4s infinite}
-.np-track{position:relative;z-index:2;display:grid;grid-template-columns:repeat(11,1fr);align-items:start;min-width:900px}.np-node{position:relative;text-align:center;cursor:pointer;transition:transform .25s ease}.np-node:hover{transform:translateY(-3px)}.np-orb{margin:auto;width:40px;height:40px;border:1px solid rgba(119,224,255,.22);border-radius:50%;display:grid;place-items:center;background:rgba(8,25,40,.9);box-shadow:0 0 0 5px rgba(119,224,255,.025),inset 0 0 18px rgba(119,224,255,.06)}.np-orb span{font-size:10px;color:rgba(220,240,255,.48);font-weight:800}.np-label{margin-top:9px;font-size:8px;letter-spacing:.08em;color:rgba(220,240,255,.4);white-space:nowrap}.np-link{position:absolute;left:50%;top:20px;width:100%;height:1px;background:linear-gradient(90deg,rgba(119,224,255,.16),rgba(119,224,255,.05));z-index:-1}.np-link i{display:block;width:22%;height:2px;background:#77e0ff;box-shadow:0 0 10px #77e0ff;animation:npFlow 2.2s linear infinite}.np-node.done .np-orb{border-color:rgba(141,255,192,.55);box-shadow:0 0 18px rgba(141,255,192,.12),inset 0 0 18px rgba(141,255,192,.08)}.np-node.done .np-orb span{color:#9dffcb}.np-node.active .np-orb{border-color:#77e0ff;box-shadow:0 0 0 7px rgba(119,224,255,.055),0 0 30px rgba(119,224,255,.24),inset 0 0 22px rgba(119,224,255,.13);animation:npCore 1.8s ease-in-out infinite}.np-node.active .np-orb span,.np-node.active .np-label{color:#77e0ff}.np-node.active .np-label{font-weight:800}.np-node.active:after{content:"";position:absolute;left:50%;top:-5px;width:52px;height:52px;transform:translateX(-50%);border:1px solid rgba(119,224,255,.18);border-radius:50%;animation:npSpin 6s linear infinite}
+.np-track{position:relative;z-index:2;display:grid;grid-template-columns:repeat(11,1fr);align-items:start;min-width:900px}.np-node{appearance:none;font:inherit;text-align:left;cursor:pointer;position:relative;text-align:center;cursor:pointer;transition:transform .25s ease}.np-node:hover{transform:translateY(-3px)}.np-orb{margin:auto;width:40px;height:40px;border:1px solid rgba(119,224,255,.22);border-radius:50%;display:grid;place-items:center;background:rgba(8,25,40,.9);box-shadow:0 0 0 5px rgba(119,224,255,.025),inset 0 0 18px rgba(119,224,255,.06)}.np-orb span{font-size:10px;color:rgba(220,240,255,.48);font-weight:800}.np-label{margin-top:9px;font-size:8px;letter-spacing:.08em;color:rgba(220,240,255,.4);white-space:nowrap}.np-link{position:absolute;left:50%;top:20px;width:100%;height:1px;background:linear-gradient(90deg,rgba(119,224,255,.16),rgba(119,224,255,.05));z-index:-1}.np-link i{display:block;width:22%;height:2px;background:#77e0ff;box-shadow:0 0 10px #77e0ff;animation:npFlow 2.2s linear infinite}.np-node.done .np-orb{border-color:rgba(141,255,192,.55);box-shadow:0 0 18px rgba(141,255,192,.12),inset 0 0 18px rgba(141,255,192,.08)}.np-node.done .np-orb span{color:#9dffcb}.np-node.active .np-orb{border-color:#77e0ff;box-shadow:0 0 0 7px rgba(119,224,255,.055),0 0 30px rgba(119,224,255,.24),inset 0 0 22px rgba(119,224,255,.13);animation:npCore 1.8s ease-in-out infinite}.np-node.active .np-orb span,.np-node.active .np-label{color:#77e0ff}.np-node.active .np-label{font-weight:800}.np-node.active:after{content:"";position:absolute;left:50%;top:-5px;width:52px;height:52px;transform:translateX(-50%);border:1px solid rgba(119,224,255,.18);border-radius:50%;animation:npSpin 6s linear infinite}
 @keyframes npPulse{50%{opacity:.35;transform:scale(.72)}}@keyframes npCore{50%{transform:scale(1.08)}}@keyframes npFlow{from{transform:translateX(-130%)}to{transform:translateX(500%)}}@keyframes npSpin{to{transform:translateX(-50%) rotate(360deg)}}
 @media(max-width:900px){.np-caption{display:none}.np-track{overflow-x:auto;display:flex;gap:38px;padding:4px 8px 10px}.np-node{min-width:72px}.np-link{width:38px;left:calc(50% + 20px)}}
 @media(prefers-reduced-motion:reduce){.np-live-dot,.np-link i,.np-node.active .np-orb,.np-node.active:after{animation:none}}
 
 
         /* FINAL DELIVERY + SCROLL EXPERIENCE */
+        .bec-notice{margin:10px 0;padding:12px 14px;border:1px solid rgba(0,216,255,.22);background:rgba(0,216,255,.06);border-radius:12px;color:#bdefff;font-size:12px;letter-spacing:.04em}
+        .bec-workspace-modal{position:fixed;inset:0;z-index:1000;background:rgba(3,7,18,.82);backdrop-filter:blur(14px);display:flex;align-items:center;justify-content:center;padding:24px}
+        .bec-workspace-modal-inner{width:min(1100px,96vw);height:min(760px,90vh);background:linear-gradient(145deg,rgba(10,18,35,.98),rgba(7,12,25,.98));border:1px solid rgba(0,216,255,.25);border-radius:20px;box-shadow:0 30px 100px rgba(0,0,0,.55);overflow:hidden}
+        .bec-workspace-modal-head{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid rgba(255,255,255,.08)}
+        .bec-workspace-modal-head h4{margin:6px 0 0;font-size:14px;word-break:break-all;color:#eafaff}
+        .bec-workspace-modal-head button{border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:#d8efff;border-radius:10px;padding:9px 13px;cursor:pointer}
+        .bec-workspace-browser{display:grid;grid-template-columns:280px 1fr;height:calc(100% - 82px)}
+        .bec-file-list{overflow:auto;border-right:1px solid rgba(255,255,255,.08);padding:10px}
+        .bec-file-list button{display:block;width:100%;text-align:left;border:0;background:transparent;color:#9db4c8;padding:9px 10px;border-radius:8px;cursor:pointer;font:inherit;font-size:12px;word-break:break-all}
+        .bec-file-list button:hover,.bec-file-list button.active{background:rgba(0,216,255,.09);color:#dff9ff}
+        .bec-file-content{margin:0;overflow:auto;padding:20px;color:#c8d8e7;font:12px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}
+        @media (max-width:760px){.bec-workspace-browser{grid-template-columns:1fr}.bec-file-list{max-height:220px;border-right:0;border-bottom:1px solid rgba(255,255,255,.08)}.bec-workspace-modal{padding:10px}.bec-workspace-modal-inner{height:94vh}}
         .workspace-main { scroll-behavior:smooth; scrollbar-width:thin; scrollbar-color:rgba(0,216,255,.22) transparent; }
         .workspace-main::-webkit-scrollbar{width:7px}.workspace-main::-webkit-scrollbar-track{background:transparent}.workspace-main::-webkit-scrollbar-thumb{background:linear-gradient(to bottom,rgba(0,216,255,.42),rgba(104,92,255,.34));border-radius:999px}
         .stage-panel{align-items:start}.main-panel{overflow:clip}.side-panel{position:sticky;top:24px}
@@ -4628,7 +4794,11 @@ export default function Home() {
         .selected-output-actions button{border:1px solid rgba(0,216,255,.24);background:linear-gradient(135deg,rgba(0,216,255,.12),rgba(104,92,255,.1));color:#c8f8ff;border-radius:8px;padding:9px 12px;font-size:8px;font-weight:900;letter-spacing:.1em;cursor:pointer}
         .selected-output-actions span{color:#657287;font-size:8px;line-height:1.5}
         @media(max-width:760px){.selected-output-content{grid-template-columns:1fr}.selected-output-header{align-items:flex-start;flex-direction:column}.output-close-button{width:100%}}
+
+.aura20-graph-canvas{position:relative;height:430px;margin-top:16px;border:1px solid rgba(255,255,255,.06);border-radius:18px;overflow:hidden;background:radial-gradient(circle at center,rgba(0,216,255,.08),transparent 42%),rgba(255,255,255,.012)}.aura20-graph-canvas:before{content:"";position:absolute;inset:14%;border:1px dashed rgba(0,216,255,.12);border-radius:50%}.aura20-graph-node{position:absolute;transform:translate(-50%,-50%);z-index:2;min-width:90px;max-width:150px;padding:9px 11px;border:1px solid rgba(0,216,255,.2);border-radius:12px;background:rgba(5,13,27,.94);color:#eafaff;cursor:pointer;box-shadow:0 8px 28px rgba(0,0,0,.25)}.aura20-graph-node b,.aura20-graph-node span{display:block}.aura20-graph-node b{font-size:9px}.aura20-graph-node span{margin-top:3px;color:#657389;font-size:7px;text-transform:uppercase;letter-spacing:.08em}.aura20-graph-node.project{border-color:rgba(0,216,255,.5);box-shadow:0 0 30px rgba(0,216,255,.18)}.aura20-edge{position:absolute;left:50%;top:50%;width:37%;height:1px;background:linear-gradient(90deg,rgba(0,216,255,.02),rgba(0,216,255,.22),rgba(104,92,255,.02));transform-origin:left center}.aura20-graph-legend{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}.aura20-graph-legend span{padding:5px 8px;border-radius:999px;background:rgba(255,255,255,.03);color:#718095;font-size:7px;font-weight:900;text-transform:uppercase}
+.validation-gate-panel{margin-top:20px;padding:18px;border:1px solid rgba(0,216,255,.12);border-radius:16px;background:linear-gradient(145deg,rgba(0,216,255,.035),rgba(104,92,255,.02))}.validation-gate-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.validation-gate-head h3{margin:7px 0 4px;font-size:18px}.validation-gate-head p{margin:0;color:#718095;font-size:10px;line-height:1.65;max-width:760px}.validation-gate-head button,.validation-gate-actions button{border:1px solid rgba(0,216,255,.2);background:rgba(0,216,255,.06);color:#bcefff;border-radius:9px;padding:9px 11px;font-size:8px;font-weight:900;letter-spacing:.1em;cursor:pointer}.validation-gate-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:15px}.validation-gate-grid>div{padding:11px;border:1px solid rgba(255,255,255,.05);border-radius:10px;background:rgba(255,255,255,.015)}.validation-gate-grid>div span{font-size:13px}.validation-gate-grid>div b,.validation-gate-grid>div small{display:block}.validation-gate-grid>div b{margin-top:5px;font-size:8px}.validation-gate-grid>div small{margin-top:3px;color:#657389;font-size:7px}.validation-gate-grid .passed{border-color:rgba(80,220,175,.18)}.validation-gate-grid .passed span{color:#72e2c4}.validation-gate-grid .blocked span{color:#68758a}.validation-gate-actions{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-top:14px}.validation-gate-actions strong{color:#8d9bae;font-size:8px;letter-spacing:.12em}.validation-gate-actions button:disabled{opacity:.45;cursor:not-allowed}.validation-gate-message{margin-top:10px;padding:9px;border-radius:8px;background:rgba(255,255,255,.025);color:#8edff1;font-size:8px}@media(max-width:760px){.validation-gate-head,.validation-gate-actions{flex-direction:column}.validation-gate-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
       `}
+
 </style>
 
       {loading && (
@@ -4652,6 +4822,451 @@ export default function Home() {
   );
 }
 
+
+function List({ value }: { value: unknown[] }) {
+  return (
+    <ul className="aura20-capability-list">
+      {value.map((item, index) => {
+        const text = typeof item === "string" ? item :
+          (item && typeof item === "object" && "title" in item && typeof (item as { title?: unknown }).title === "string")
+            ? (item as { title: string }).title
+            : JSON.stringify(item);
+        return (
+          <li key={`${index}-${text}`}>
+            <span className="aura20-list-dot">✦</span>
+            <span>{text}</span>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+function AuraTwoPointZero({ project, idea, projectName }: { project: Project | null; idea: string; projectName: string }) {
+  const [tab, setTab] = useState("detail");
+  const [blueprint, setBlueprint] = useState<any>(null);
+  const [graph, setGraph] = useState<any>(null);
+  const [recs, setRecs] = useState<any[]>([]);
+  const [viva, setViva] = useState<any>(null);
+  const [docText, setDocText] = useState("");
+  const [docAnalysis, setDocAnalysis] = useState<any>(null);
+  const [claims, setClaims] = useState("");
+  const [evidence, setEvidence] = useState("");
+  const [claimAnalysis, setClaimAnalysis] = useState<any>(null);
+  const [researchQuery, setResearchQuery] = useState(idea || "");
+  const [research, setResearch] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+
+  async function call(path: string, init?: RequestInit) {
+    const response = await auraFetch(API_BASE + path, {
+      ...init,
+      headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || "AURA 2.0 request failed.");
+    return data;
+  }
+
+  async function runDetail() {
+    setBusy(true); setMessage("");
+    try {
+      const data = await call("/api/aura/blueprint", {
+        method: "POST",
+        body: JSON.stringify({ idea: idea || "AURA research project", project_name: projectName || undefined }),
+      });
+      setBlueprint(data.blueprint);
+      setTab("detail");
+    } catch (e) { setMessage(e instanceof Error ? e.message : "Unable to generate blueprint."); }
+    finally { setBusy(false); }
+  }
+
+  async function loadProjectTools() {
+    if (!project?.project_id) {
+      setMessage("Run or open an AURA project first to use project-linked intelligence.");
+      return;
+    }
+    setBusy(true); setMessage("");
+    try {
+      const [g, r, v] = await Promise.all([
+        call(`/api/aura/projects/${project.project_id}/graph`),
+        call(`/api/aura/projects/${project.project_id}/recommendations`),
+        call(`/api/aura/projects/${project.project_id}/viva`),
+      ]);
+      setGraph(g.graph); setRecs(r.recommendations || []); setViva(v.viva);
+    } catch (e) { setMessage(e instanceof Error ? e.message : "Unable to load project intelligence."); }
+    finally { setBusy(false); }
+  }
+
+  async function analyzeDoc() {
+    if (!docText.trim()) return;
+    setBusy(true);
+    try {
+      const data = await call("/api/aura/document/analyze", {
+        method: "POST", body: JSON.stringify({ text: docText, filename: "AURA document" }),
+      });
+      setDocAnalysis(data.analysis); setTab("documents");
+    } catch (e) { setMessage(e instanceof Error ? e.message : "Document analysis failed."); }
+    finally { setBusy(false); }
+  }
+
+  async function analyzeClaims() {
+    setBusy(true);
+    try {
+      const data = await call("/api/aura/claims/analyze", {
+        method: "POST", body: JSON.stringify({
+          claims: claims.split("\n").map(x => x.trim()).filter(Boolean),
+          evidence: evidence.split("\n").map(x => x.trim()).filter(Boolean),
+        }),
+      });
+      setClaimAnalysis(data.analysis); setTab("evidence");
+    } catch (e) { setMessage(e instanceof Error ? e.message : "Claim analysis failed."); }
+    finally { setBusy(false); }
+  }
+
+  async function runResearch() {
+    if (!researchQuery.trim()) return;
+    setBusy(true);
+    try {
+      const data = await call("/api/aura/research/web", {
+        method: "POST", body: JSON.stringify({ query: researchQuery, limit: 8 }),
+      });
+      setResearch(data); setTab("research");
+    } catch (e) { setMessage(e instanceof Error ? e.message : "Research search failed."); }
+    finally { setBusy(false); }
+  }
+
+  const sections = blueprint ? Object.entries(blueprint).filter(([k]) => k !== "domains" && k !== "keywords" && k !== "completion_gates") : [];
+  return (
+    <div className="aura20-shell">
+      <div className="aura20-head">
+        <div>
+          <div className="aura20-kicker">AURA 2.0 / INTELLIGENCE LAYER</div>
+          <h2>✦ AURA DETAIL</h2>
+          <p>Extend the original AURA journey with project definition, evidence intelligence, graph reasoning, research discovery and delivery intelligence.</p>
+        </div>
+        <button className="aura20-primary" onClick={runDetail} disabled={busy}>✦ {busy ? "PROCESSING..." : "GENERATE DETAIL"}</button>
+      </div>
+      <div className="aura20-tabs">
+        {[
+          ["detail","✦ AURA DETAIL"],["research","⌕ RESEARCH"],["evidence","◉ EVIDENCE"],["graph","⌬ GRAPH"],["execution","∿ EXPERIMENT / VALIDATE"],["delivery","▣ DELIVERY / VIVA"],["team","◈ TEAM / ROLES"]
+        ].map(([key,label]) => <button key={key} className={tab === key ? "active" : ""} onClick={() => { setTab(key); if (key === "graph" || key === "delivery") loadProjectTools(); }}>{label}</button>)}
+      </div>
+      {message && <div className="aura20-message">{message}</div>}
+
+      {tab === "detail" && (
+        <>
+        <DependencyImpactPanel project={project} />
+        <InnovationImplementationTraceability project={project} />
+        <div className="aura20-truth-dashboard">
+          <div className="aura20-truth-heading"><div><span>TRUTH-AWARE PROJECT CONTROL</span><h3>AURA PROJECT STATUS</h3></div><div className="aura20-truth-badge">🛡 NO FABRICATED RESULTS</div></div>
+          <div className="aura20-status-flow">
+            {[
+              ["DESIGNED", "COMPLETE", "done"],
+              ["RESEARCHED", "EVIDENCE REQUIRED", "warn"],
+              ["IMPLEMENTED", "READY", "ready"],
+              ["EXECUTED", "NOT EXECUTED", "blocked"],
+              ["MEASURED", "PENDING", "blocked"],
+              ["VALIDATED", "PENDING", "blocked"],
+              ["DELIVERED", "PENDING", "blocked"],
+            ].map(([title, state, tone]) => <div className={`aura20-status-step ${tone}`} key={title}><span>{title}</span><b>{state}</b></div>)}
+          </div>
+          <p className="aura20-truth-note"><b>Workflow completion ≠ scientific validation ≠ project execution.</b> AURA separates generated design decisions from real-world evidence.</p>
+        </div>
+        <div className="aura20-grid">
+          <div className="aura20-card wide">
+            <div className="aura20-label">PROJECT BLUEPRINT</div>
+            {!blueprint ? <p>Enter an idea in the original AURA input and use <b>GENERATE DETAIL</b>. The result expands it into an 11-area project specification.</p> :
+              <>
+              <div className="aura20-blueprint-meta"><div><span>AGENT</span><b>AURA Project Definition Agent · Intelligence Engine</b></div><div><span>TRUTH STATUS</span><b>DESIGNED — NOT EXECUTED</b></div></div>
+              <div className="aura20-blueprint">{sections.map(([key,value]) =>
+                <div className="aura20-section" key={key}><h3>{humanizeKey(key)}</h3><BlueprintValue value={value} /></div>
+              )}</div></>}
+          </div>
+          <div className="aura20-card">
+            <div className="aura20-label">TRUTH BOUNDARY</div>
+            <h3>Scientific truth protection</h3>
+            <p>Plans, generated architectures and proposed experiments are not execution results. AURA must not fabricate metrics, datasets, screenshots or validation claims.</p>
+          </div>
+          <div className="aura20-card">
+            <div className="aura20-label">V2 CAPABILITIES</div>
+            <List value={["Project Definition Agent","Literature / Crossref discovery","Evidence & claim scoring","Research graph","Multi-agent role model","Experiment & validation gates","Document analysis","Gap / innovation recommendations","Viva generation","Authentication & persistent local memory"]} />
+          </div>
+        </div>
+        </>
+      )}
+
+      {tab === "research" && <div className="aura20-card">
+        <div className="aura20-label">RESEARCH INTELLIGENCE</div>
+        <div className="aura20-form"><input value={researchQuery} onChange={e=>setResearchQuery(e.target.value)} placeholder="Research topic or question"/><button onClick={runResearch} disabled={busy}>SEARCH</button></div>
+        <p className="aura20-note">Source discovery uses the public Crossref API. Discovered sources are evidence candidates, not automatically verified truth.</p>
+        {research?.results?.map((r:any,i:number)=><div className="aura20-result" key={i}><b>{r.title || "Untitled"}</b><span>{r.DOI || "No DOI"}</span><p>{r.container_title || ""} {r.published ? "• "+JSON.stringify(r.published) : ""}</p></div>)}
+      </div>}
+
+      {tab === "evidence" && <div className="aura20-grid">
+        <div className="aura20-card"><div className="aura20-label">CLAIMS</div><textarea value={claims} onChange={e=>setClaims(e.target.value)} placeholder="One claim per line"/><textarea value={evidence} onChange={e=>setEvidence(e.target.value)} placeholder="Evidence statements, one per line"/><button className="aura20-primary" onClick={analyzeClaims} disabled={busy}>ANALYZE SUPPORT</button></div>
+        <div className="aura20-card"><div className="aura20-label">ANALYSIS</div>{claimAnalysis ? <pre>{JSON.stringify(claimAnalysis,null,2)}</pre> : <p>Support scores are heuristic lexical signals, not scientific verification.</p>}</div>
+      </div>}
+
+      {tab === "graph" && <div className="aura20-card"><div className="aura20-label">PROJECT RESEARCH GRAPH</div><button className="aura20-primary" onClick={loadProjectTools} disabled={busy}>REFRESH GRAPH</button>{graph ? <><div className="aura20-graph-canvas">{(graph.edges||[]).map((e:any,i:number)=><div className="aura20-edge" key={`edge-${i}`} />)}{(graph.nodes||[]).map((n:any,i:number)=>{ const total=Math.max(1,(graph.nodes||[]).length); const angle=(i/total)*Math.PI*2; const x=50+37*Math.cos(angle); const y=50+37*Math.sin(angle); return <button type="button" className={`aura20-graph-node ${n.type||""}`} key={n.id} style={{left:`${x}%`,top:`${y}%`}} title={`${n.label} · ${n.type}`}><b>{n.label}</b><span>{n.type}{n.count ? ` · ${n.count}` : ""}</span></button>})}</div><div className="aura20-graph-legend">{(graph.filters||[]).map((f:string)=><span key={f}>{f}</span>)}</div></> : <p>Open a project and refresh to build the graph from its actual state.</p>}</div>}
+
+      {tab === "execution" && <div className="aura20-grid"><div className="aura20-card"><div className="aura20-label">EXPERIMENT GATES</div><List value={["Define hypothesis","Declare baseline","Define metrics","Execute experiment","Record raw results","Compare baseline vs proposed","Review reproducibility","Human scientific validation"]}/></div><div className="aura20-card"><div className="aura20-label">VALIDATION STATUS</div><h3>NOT CLAIMED</h3><p>Designed experiments are not presented as completed experiments. Measured results enter AURA only after real execution.</p></div></div>}
+
+      {tab === "delivery" && <div className="aura20-grid"><div className="aura20-card"><div className="aura20-label">DOCUMENT ANALYSIS</div><textarea value={docText} onChange={e=>setDocText(e.target.value)} placeholder="Paste paper/report text here..."/><button className="aura20-primary" onClick={analyzeDoc} disabled={busy}>ANALYZE DOCUMENT</button>{docAnalysis&&<pre>{JSON.stringify(docAnalysis,null,2)}</pre>}</div><div className="aura20-card"><div className="aura20-label">VIVA / RECOMMENDATIONS</div><button className="aura20-primary" onClick={loadProjectTools} disabled={busy}>GENERATE PROJECT PACK</button>{recs.length>0&&<List value={recs}/>} {viva&&<pre>{JSON.stringify(viva,null,2)}</pre>}</div></div>}
+
+      {tab === "team" && <div className="aura20-grid"><div className="aura20-card"><div className="aura20-label">MULTI-AGENT COUNCIL</div><List value={["Research Agent","Evidence Agent","Claim Analyst","Innovation Agent","Architect Agent","Experiment Agent","Validation Agent","Delivery Agent"]}/></div><div className="aura20-card"><div className="aura20-label">COLLABORATION ROLES</div><List value={["researcher","project_manager","developer","admin"]}/><p>Role-based collaboration architecture is available in the AURA 2.0 backend.</p></div></div>}
+    </div>
+  );
+}
+
+function UnifiedProjectIntelligence({ project }: { project: Project | null }) {
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = async () => {
+    if (!project?.project_id) return;
+    setLoading(true);
+    try {
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/intelligence/unified`, { cache: "no-store" });
+      if (!r.ok) throw new Error("Unified intelligence unavailable");
+      setData(await r.json());
+    } catch { setData(null); }
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => { load(); }, [project?.project_id]);
+  if (!project) return null;
+
+  const truth = data?.truth || {};
+  const completion = data?.completion || {};
+  const gate = data?.validation_gate || {};
+  const impact = data?.dependency_impact || {};
+  const obs = data?.results_observatory || {};
+  const dimensions = data?.intelligence?.dimensions || {};
+
+  return (
+    <section className="aura20-card wide" style={{ marginBottom: 18 }}>
+      <div className="aura20-label">AURA 6.1 / UNIFIED PROJECT INTELLIGENCE</div>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 16, alignItems: "center" }}>
+        <div><h3>One truth pipeline across the project</h3><p>Project Twin → dependency impact → results → validation → completion. Each layer remains evidence-aware.</p></div>
+        <button className="aura20-primary" onClick={load} disabled={loading}>{loading ? "SYNCING..." : "SYNC INTELLIGENCE"}</button>
+      </div>
+      {!data ? <p className="aura20-note">Unified state will appear when the project is available.</p> : <>
+        <div className="aci-metrics" style={{ marginTop: 14 }}>
+          <div className="aci-metric"><span>WORKFLOW</span><strong>{Number(truth.workflow || 0).toFixed(0)}%</strong></div>
+          <div className="aci-metric"><span>RESULTS</span><strong>{obs.measured_results ? "MEASURED" : "PENDING"}</strong></div>
+          <div className="aci-metric"><span>VALIDATION</span><strong>{gate.ready ? "READY" : "BLOCKED"}</strong></div>
+          <div className="aci-metric"><span>COMPLETION</span><strong>{completion.completed ? "COMPLETE" : "IN PROGRESS"}</strong></div>
+        </div>
+        <div className="aura20-grid" style={{ marginTop: 14 }}>
+          <div className="aura20-card"><div className="aura20-label">PROJECT HEALTH</div>{Object.entries(dimensions).map(([k,v]) => <div key={k} className="aura20-result"><b>{humanizeKey(k)}</b><span>{Number(v || 0).toFixed(0)}%</span></div>)}</div>
+          <div className="aura20-card"><div className="aura20-label">VALIDATION GATE</div><h3>{gate.status || "BLOCKED"}</h3><p>{gate.required_passed || 0} / {gate.required_total || 0} required criteria passed.</p><p className="aura20-note">Scientific validation: {truth.scientific_validation ? "RECORDED" : "NOT RECORDED"} · Human approval: {truth.human_approval ? "RECORDED" : "NOT RECORDED"}</p></div>
+          <div className="aura20-card"><div className="aura20-label">DEPENDENCY IMPACT</div><h3>{impact.requires_reexecution ? "RE-EXECUTION REQUIRED" : "NO RE-EXECUTION FLAG"}</h3><p>{Array.isArray(impact.impacted_nodes) ? impact.impacted_nodes.length : 0} downstream nodes impacted.</p><p className="aura20-note">{impact.requires_revalidation ? "Re-validation is required." : "No re-validation flag."}</p></div>
+          <div className="aura20-card"><div className="aura20-label">TRUTH BOUNDARY</div><p><b>{completion.status || "IN_PROGRESS"}</b></p><p>{truth.boundary}</p></div>
+        </div>
+      </>}
+    </section>
+  );
+}
+
+function AuraRequirementsAudit() {
+  const [audit, setAudit] = useState<Record<string, unknown> | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [open, setOpen] = useState(false);
+
+  const load = () => {
+    setLoading(true);
+    auraFetch(`${API_BASE}/api/aura/requirements/audit`, { cache: "no-store" })
+      .then((r) => r.ok ? r.json() : Promise.reject(new Error("Audit unavailable")))
+      .then((data) => setAudit(isRecord(data.audit) ? data.audit : null))
+      .catch(() => setAudit(null))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const summary = isRecord(audit?.summary) ? audit.summary : {};
+  const atomic = isRecord(audit?.atomic_649) ? audit.atomic_649 : {};
+  const areas = Array.isArray(audit?.areas) ? audit.areas : [];
+  const implemented = Number(summary.implemented) || 0;
+  const partial = Number(summary.partial) || 0;
+  const missing = Number(summary.missing) || 0;
+  const total = Number(audit?.area_count) || areas.length || 0;
+
+  return (
+    <section className="aura-requirements-audit">
+      <div className="ara-head">
+        <div>
+          <span>REQUIREMENTS CONTROL</span>
+          <h3>Implementation Audit</h3>
+          <p>Repository evidence is tracked separately from atomic requirement verification.</p>
+        </div>
+        <div className="ara-actions">
+          <button type="button" onClick={load} disabled={loading}>{loading ? "SYNCING…" : "REFRESH AUDIT"}</button>
+          <button type="button" onClick={() => setOpen(v => !v)}>{open ? "HIDE DETAIL" : "VIEW DETAIL"}</button>
+        </div>
+      </div>
+      <div className="ara-summary">
+        <div><b>{implemented}</b><span>IMPLEMENTED AREAS</span></div>
+        <div><b>{partial}</b><span>PARTIAL</span></div>
+        <div><b>{missing}</b><span>MISSING</span></div>
+        <div><b>{total}</b><span>TOTAL AREAS</span></div>
+        <div className={atomic.available === true ? "ara-atomic ready" : "ara-atomic"}><b>{atomic.available === true ? "READY" : "SOURCE REQUIRED"}</b><span>649-ITEM ATOMIC AUDIT</span></div>
+      </div>
+      {open && (
+        <div className="ara-detail">
+          {areas.map((item, i) => {
+            const row = isRecord(item) ? item : {};
+            const status = safeText(row.status) || "UNKNOWN";
+            return <div key={`${safeText(row.area)}-${i}`} className={`ara-row ${status.toLowerCase()}`}><span>{safeText(row.area)}</span><b>{status}</b></div>;
+          })}
+          <small>{safeText(atomic.message) || "Atomic requirement source status unavailable."}</small>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function AuraProjectIntelligenceOverview({ project }: { project: Project | null }) {
+  const [overview, setOverview] = useState<Record<string, unknown> | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!project?.project_id) return;
+    let cancelled = false;
+    setLoading(true);
+    auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/overview`, { cache: "no-store" })
+      .then((r) => r.ok ? r.json() : Promise.reject(new Error("Overview unavailable")))
+      .then((data) => { if (!cancelled) setOverview(isRecord(data.overview) ? data.overview : null); })
+      .catch(() => { if (!cancelled) setOverview(null); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [project?.project_id, project?.status, project?.current_stage]);
+
+  if (!project?.project_id) return null;
+  const dimensions = isRecord(overview?.dimensions) ? overview!.dimensions : {};
+  const truth = isRecord(overview?.truth) ? overview!.truth : {};
+  const next = isRecord(overview?.next_best_action) ? overview!.next_best_action : {};
+  const blockers = Array.isArray(overview?.blockers) ? overview!.blockers : [];
+  const pairs: Array<[string, unknown]> = [
+    ["Research", dimensions.research], ["Development", dimensions.development],
+    ["Data", dimensions.data], ["Experiment", dimensions.experimentation],
+    ["Validation", dimensions.validation], ["Delivery", dimensions.delivery],
+  ];
+
+  return (
+    <section className="project-intelligence-overview">
+      <div className="pio-head">
+        <div>
+          <span className="pio-kicker">AURA PROJECT INTELLIGENCE</span>
+          <h3>How to complete this project</h3>
+          <p>Live guidance derived from the current project state, lifecycle dependencies and truth boundary.</p>
+        </div>
+        <div className="pio-truth">{safeText(truth.status) || (loading ? "SYNCING" : "LIVE")}</div>
+      </div>
+      <div className="pio-grid">
+        {pairs.map(([label, value]) => (
+          <div className="pio-dimension" key={String(label)}>
+            <div><span>{label}</span><b>{typeof value === "number" ? `${Math.round(value)}%` : "—"}</b></div>
+            <div className="pio-track"><i style={{ width: `${Math.max(0, Math.min(100, Number(value) || 0))}%` }} /></div>
+          </div>
+        ))}
+      </div>
+      <div className="pio-action">
+        <div><span>NEXT BEST ACTION</span><strong>{safeText(next.title) || "Syncing project intelligence…"}</strong><p>{safeText(next.action)}</p></div>
+        <div className="pio-action-meta"><b>{safeText(next.where)}</b><small>{Array.isArray(next.blocks) && next.blocks.length ? `Blocks: ${next.blocks.join(" → ")}` : "No downstream blockers identified"}</small></div>
+      </div>
+      {blockers.length > 0 && (
+        <div className="pio-blockers">
+          <span>ACTIVE BLOCKERS</span>
+          {blockers.slice(0, 4).map((item, i) => {
+            const b = isRecord(item) ? item : {};
+            return <div key={`${safeText(b.stage)}-${i}`}><b>{safeText(b.title)}</b><small>{safeText(b.reason)}</small></div>;
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function DecisionIntelligencePanel({ project }: { project: Project | null }) {
+  const [data, setData] = useState<Record<string, any> | null>(null);
+  const [busy, setBusy] = useState(false);
+  const load = async () => {
+    if (!project?.project_id) return;
+    setBusy(true);
+    try {
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/decision-intelligence`, { cache: "no-store" });
+      if (r.ok) {
+        const d = await r.json();
+        setData(isRecord(d.decision_intelligence) ? d.decision_intelligence : null);
+      }
+    } finally { setBusy(false); }
+  };
+  useEffect(() => { load(); }, [project?.project_id, project?.status, project?.current_stage]);
+  if (!project?.project_id) return null;
+  const risks = Array.isArray(data?.risks) ? data!.risks : [];
+  const blockers = Array.isArray(data?.blockers) ? data!.blockers : [];
+  const actions = Array.isArray(data?.next_best_actions) ? data!.next_best_actions : [];
+  const basis = isRecord(data?.evidence_basis) ? data!.evidence_basis : {};
+  return <section className="decision-intelligence-panel">
+    <div className="dip2-head">
+      <div><span>DECISION INTELLIGENCE · AURA 6.1</span><h3>What should happen next?</h3><p>Deterministic decisions from the current project state, evidence basis, dependencies, risks and blockers.</p></div>
+      <button onClick={load} disabled={busy}>{busy ? "SYNCING…" : "REFRESH"}</button>
+    </div>
+    <div className="dip2-stats">
+      <div><b>{safeText(data?.risk_level) || "—"}</b><span>RISK LEVEL</span></div>
+      <div><b>{safeText(data?.decision_confidence) || "—"}</b><span>DECISION CONFIDENCE</span></div>
+      <div><b>{blockers.length}</b><span>ACTIVE BLOCKERS</span></div>
+      <div><b>{actions.length}</b><span>RANKED ACTIONS</span></div>
+    </div>
+    <div className="dip2-grid">
+      <div className="dip2-card"><span>RECOMMENDED ACTION</span><h4>{safeText(data?.recommended_action?.title) || "Syncing decision intelligence…"}</h4><p>{safeText(data?.recommended_action?.action)}</p><small>{safeText(data?.recommended_action?.why_now)}</small></div>
+      <div className="dip2-card"><span>EVIDENCE BASIS</span><h4>{Number(basis.approved) || 0} approved · {Number(basis.reviewed) || 0} reviewed</h4><p>{Number(basis.total) || 0} evidence records · {Number(basis.sourced) || 0} sourced/provenanced</p><small>Evidence quality affects decision confidence; it does not create scientific truth.</small></div>
+    </div>
+    {risks.length > 0 && <div className="dip2-list"><span>RISK REGISTER</span>{risks.slice(0, 5).map((r: any) => <div key={safeText(r.id)}><b>{safeText(r.severity)} · {safeText(r.source)}</b><small>{safeText(r.reason)}</small><em>Mitigation: {safeText(r.mitigation)}</em></div>)}</div>}
+    {blockers.length > 0 && <div className="dip2-list"><span>BLOCKERS</span>{blockers.slice(0, 5).map((b: any) => <div key={safeText(b.stage)}><b>{safeText(b.severity)} · {safeText(b.title)}</b><small>{safeText(b.reason)}</small></div>)}</div>}
+    <div className="dip2-actions"><span>NEXT BEST ACTION QUEUE</span>{actions.slice(0, 5).map((a: any, i: number) => <div key={safeText(a.id)}><strong>{i + 1}. {safeText(a.title)}</strong><small>{safeText(a.why_now)}</small></div>)}</div>
+    <small className="dip2-truth">{safeText(data?.truth) || "Decision Intelligence does not certify scientific validity or project completion."}</small>
+  </section>;
+}
+
+function InnovationImplementationTraceability({ project }: { project: Project | null }) {
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(false);
+  const load = async () => {
+    if (!project?.project_id) return;
+    setLoading(true);
+    try {
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/innovation-traceability`, { cache: "no-store" });
+      if (!r.ok) throw new Error("Innovation traceability unavailable");
+      const j = await r.json(); setData(j.traceability || null);
+    } catch { setData(null); } finally { setLoading(false); }
+  };
+  useEffect(() => { load(); }, [project?.project_id]);
+  if (!project) return null;
+  const chain = ["innovation","requirement","architecture","implementation","dataset","experiment","result","validation"];
+  const counts = data?.counts || {};
+  return <section className="aura20-card wide" style={{ marginBottom: 18 }}>
+    <div className="aura20-label">INNOVATION → IMPLEMENTATION TRACEABILITY</div>
+    <div style={{display:"flex",justifyContent:"space-between",gap:16,alignItems:"center"}}>
+      <div><h3>Does the innovation become a real project component?</h3><p>Explicit links connect the innovation to requirements, architecture, implementation, experiments, results and validation.</p></div>
+      <button className="aura20-primary" onClick={load} disabled={loading}>{loading ? "CHECKING..." : "REFRESH TRACE"}</button>
+    </div>
+    {!data ? <p className="aura20-note">Traceability will appear when the project state is available.</p> : <>
+      <div className="aci-metrics" style={{marginTop:14}}>
+        <div className="aci-metric"><span>COVERAGE</span><strong>{Number(data.coverage_percent || 0).toFixed(0)}%</strong></div>
+        <div className="aci-metric"><span>ORPHAN / MISSING</span><strong>{(data.missing_links || []).length}</strong></div>
+        <div className="aci-metric"><span>RESULTS</span><strong>{counts.result || 0}</strong></div>
+        <div className="aci-metric"><span>VALIDATION</span><strong>{counts.validation || 0}</strong></div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,minmax(0,1fr))",gap:8,marginTop:14}}>
+        {chain.map((key, i) => <div key={key} className="aura20-result"><b>{i+1}. {humanizeKey(key)}</b><span>{counts[key] || 0}</span></div>)}
+      </div>
+      <p className="aura20-note" style={{marginTop:12}}><b>TRUTH:</b> traceability proves recorded relationships only. It does not prove that implementation was executed, results are scientifically valid, or validation is approved.</p>
+    </>}
+  </section>;
+}
 
 function AuraCommandCenter({
   stage,
@@ -4697,7 +5312,7 @@ function AuraCommandCenter({
     ? analysis.findings
     : Array.isArray(analysis.canonical_findings) && analysis.canonical_findings.length
       ? analysis.canonical_findings
-      : Array.isArray(analysis.research_intelligence?.findings) && analysis.research_intelligence.findings.length
+      : isRecord(analysis.research_intelligence) && Array.isArray(analysis.research_intelligence.findings) && analysis.research_intelligence.findings.length
         ? analysis.research_intelligence.findings
         : researchFindings;
 
@@ -4714,11 +5329,11 @@ function AuraCommandCenter({
       "evidence_coverage_percent",
       "coverage_percent",
     ]) ??
-    findValue(analysis.claim_analysis, [
+    findValue(isRecord(analysis.claim_analysis) ? analysis.claim_analysis : {}, [
       "coverage_percent",
       "claim_evidence_coverage_percent",
     ]) ??
-    findValue(analysis.evidence_synthesis?.evidence_base, [
+    findValue(isRecord(analysis.evidence_synthesis) && isRecord(analysis.evidence_synthesis.evidence_base) ? analysis.evidence_synthesis.evidence_base : {}, [
       "coverage_percent",
     ]) ??
     findValue(research, [
@@ -4760,6 +5375,13 @@ function AuraCommandCenter({
   ];
 
   return (
+    <>
+    <AuraProjectIntelligenceOverview project={project} />
+    <UnifiedProjectIntelligence project={project} />
+    <AuraRequirementsAudit />
+    <ResultsObservatoryPanel project={project} />
+    <ReproducibilityLineagePanel project={project} />
+    <DecisionIntelligencePanel project={project} />
     <section className="aura-command-insights">
       <div className="aci-head">
         <div>
@@ -4873,6 +5495,7 @@ function AuraCommandCenter({
         </div>
       )}
     </section>
+    </>
   );
 }
 
@@ -4883,21 +5506,37 @@ function BuildExecutionCenter({ project }: { project: Project | null }) {
   const [results, setResults] = useState<any>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [workspaceFiles, setWorkspaceFiles] = useState<string[]>([]);
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [workspaceFile, setWorkspaceFile] = useState<string | null>(null);
+  const [workspaceContent, setWorkspaceContent] = useState("");
 
   const projectId = project?.project_id || "";
 
   async function loadBuild() {
     if (!projectId) return;
     try {
-      const r = await fetch(`${API_BASE}/api/aura/projects/${projectId}/build`);
-      const d = await r.json();
-      if (r.ok) setBuild(d.build || null);
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${projectId}/build`, { cache: "no-store" });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok) {
+        setBuild(d.build || null);
+        return;
+      }
+      // Recover browser-only projects automatically instead of showing
+      // "project not found" when the backend has restarted.
+      if (r.status === 404 && project) {
+        await syncProjectToBackend();
+        const retry = await auraFetch(`${API_BASE}/api/aura/projects/${projectId}/build`, { cache: "no-store" });
+        const retryData = await retry.json().catch(() => ({}));
+        if (retry.ok) setBuild(retryData.build || null);
+      }
     } catch {}
   }
 
   async function loadResults() {
     try {
-      const r = await fetch(`${API_BASE}/api/aura/projects/${projectId}/results`);
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${projectId}/results`);
       const d = await r.json();
       if (r.ok) setResults(d.results || null);
     } catch {}
@@ -4914,35 +5553,101 @@ function BuildExecutionCenter({ project }: { project: Project | null }) {
 
   async function loadExecutions() {
     try {
-      const r = await fetch(`${API_BASE}/api/aura/projects/${projectId}/executions`);
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${projectId}/executions`);
       const d = await r.json();
       setExecutions(Array.isArray(d.executions) ? d.executions : []);
     } catch {}
   }
+  async function syncProjectToBackend() {
+    if (!projectId || !project) return false;
+    const r = await auraFetch(`${API_BASE}/api/aura/projects/${projectId}/snapshot`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(project),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.detail || "AURA could not synchronize the project workspace.");
+    }
+    return true;
+  }
+
   async function callBuild() {
     setBusy("build"); setError("");
     try {
-      const r = await fetch(`${API_BASE}/api/aura/projects/${projectId}/build`, { method: "POST" });
+      // Browser-saved projects can outlive the backend process. Restore the exact
+      // project snapshot first so BUILD never runs against a phantom project ID.
+      await syncProjectToBackend();
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${projectId}/build`, { method: "POST" });
       const d = await r.json(); if (!r.ok) throw new Error(d.detail || "Build failed");
-      setBuild(d.build); await loadExecutions(); await loadResults();
+      setBuild(d.build);
+      await Promise.all([loadExecutions(), loadResults(), loadBuild()]);
+      setNotice("WORKSPACE GENERATED → STARTING CONTROLLED SMOKE TEST…");
+      const smoke = await auraFetch(`${API_BASE}/api/aura/projects/${projectId}/executions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: "smoke_test", timeout_seconds: 300 }) });
+      const smokeData = await smoke.json().catch(() => ({}));
+      if (!smoke.ok) throw new Error(smokeData.detail || "Smoke test failed to start");
+      setNotice(`SMOKE TEST → ${smokeData.execution?.status || "EXECUTED"}`);
+      await Promise.all([loadExecutions(), loadResults(), loadBuild()]);
     } catch (e) { setError(e instanceof Error ? e.message : "Build failed"); }
     finally { setBusy(null); }
   }
   async function runTask(task: string) {
-    setBusy(task); setError("");
+    setBusy(task); setError(""); setNotice("");
     try {
-      const r = await fetch(`${API_BASE}/api/aura/projects/${projectId}/executions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task, timeout_seconds: 300 }) });
-      const d = await r.json(); if (!r.ok) throw new Error(d.detail || "Execution failed");
-      await loadExecutions(); await loadResults();
+      if (!build?.workspace) throw new Error("Generate the real project workspace before running this task.");
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${projectId}/executions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task, timeout_seconds: 300 }) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detail || "Execution failed");
+      const execution = d.execution || {};
+      setNotice(`${String(execution.task || task).split("_").join(" ").toUpperCase()} → ${execution.status || "COMPLETED"}${execution.exit_code !== undefined && execution.exit_code !== null ? ` · exit ${execution.exit_code}` : ""}`);
+      await Promise.all([loadExecutions(), loadResults(), loadBuild()]);
     } catch (e) { setError(e instanceof Error ? e.message : "Execution failed"); }
     finally { setBusy(null); }
+  }
+
+  async function runCompleteVerification() {
+    setError(""); setNotice(""); setBusy("verification");
+    try {
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${projectId}/verification/run`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ use_development_fixture: true }) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detail || "Complete verification failed.");
+      setNotice(d.verification?.passed ? "COMPLETE ENGINEERING VERIFICATION PASSED — synthetic fixture only; not scientific evidence." : "Verification stopped; inspect the execution record.");
+      await Promise.all([loadExecutions(), loadResults(), loadBuild()]);
+    } catch (e) { setError(e instanceof Error ? e.message : "Complete verification failed"); }
+    finally { setBusy(null); }
+  }
+
+  async function openWorkspace() {
+    setError("");
+    try {
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${projectId}/workspace`);
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detail || "Workspace could not be opened.");
+      setWorkspaceFiles(Array.isArray(d.files) ? d.files : []);
+      setWorkspaceOpen(true);
+    } catch (e) { setError(e instanceof Error ? e.message : "Workspace could not be opened."); }
+  }
+
+  async function openWorkspaceFile(file: string) {
+    try {
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${projectId}/workspace/file?path=${encodeURIComponent(file)}`);
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detail || "File could not be opened.");
+      setWorkspaceFile(file); setWorkspaceContent(String(d.content || ""));
+    } catch (e) { setError(e instanceof Error ? e.message : "File could not be opened."); }
   }
 
   if (!projectId) return null;
 
   const latest = executions[0];
-  const comparison = results?.comparison && typeof results.comparison === "object" ? results.comparison : {};
-  const metricRows = ["map50", "map50_95", "precision", "recall"];
+  const comparison: Record<string, any> =
+    results?.comparison && typeof results.comparison === "object" && !Array.isArray(results.comparison)
+      ? results.comparison as Record<string, any>
+      : {};
+  const metricRows: string[] =
+    Array.isArray(results?.evaluation_metrics) && results.evaluation_metrics.length
+      ? results.evaluation_metrics.filter((metric: unknown): metric is string => typeof metric === "string")
+      : Object.keys(comparison);
   const proposed = results?.proposed?.metrics || {};
   const baseline = results?.baseline?.metrics || {};
   const status = String(results?.status || "NOT_EXECUTED");
@@ -4952,26 +5657,40 @@ function BuildExecutionCenter({ project }: { project: Project | null }) {
     <div className="bec-head"><div><span className="aci-section-title">AURA BUILD & EXECUTION CORE</span><h3>Build the actual project — then execute it.</h3><p>AURA separates generated documentation from the real project workspace, controlled execution, measured results and validation evidence.</p></div><div className="bec-state">{build?.status === "READY" || build?.workspace ? "WORKSPACE READY" : "BUILD REQUIRED"}</div></div>
     <div className="bec-flow"><span>WORKSPACE</span><b>→</b><span>CODE</span><b>→</b><span>TEST</span><b>→</b><span>EXPERIMENT</span><b>→</b><span>RESULTS</span><b>→</b><span>VALIDATION</span><b>→</b><span>DELIVERY</span></div>
     <div className="bec-actions">
-      <button onClick={callBuild} disabled={busy !== null}>{busy === "build" ? "GENERATING…" : "GENERATE REAL PROJECT WORKSPACE"}</button>
+      <button type="button" onClick={callBuild} disabled={busy !== null}>{busy === "build" ? "GENERATING…" : "GENERATE REAL PROJECT WORKSPACE"}</button>
       {(build?.status === "READY" || Boolean(build?.workspace)) && <>
-        <button onClick={() => runTask("smoke_test")} disabled={busy !== null}>{busy === "smoke_test" ? "RUNNING…" : "RUN SMOKE TEST"}</button>
-        <button onClick={() => runTask("dataset_prepare")} disabled={busy !== null}>PREPARE DATASET</button>
-        <button onClick={() => runTask("baseline_evaluate")} disabled={busy !== null}>EVALUATE BASELINE</button>
-        <button onClick={() => runTask("train_model")} disabled={busy !== null}>RUN PROPOSED TRAINING</button>
-        <button onClick={() => runTask("evaluate_model")} disabled={busy !== null}>EVALUATE PROPOSED</button>
-        <button onClick={() => runTask("experiment_run")} disabled={busy !== null}>{busy === "experiment_run" ? "RUNNING…" : "RUN FULL EXPERIMENT"}</button>
+        <button type="button" onClick={openWorkspace} disabled={busy !== null}>OPEN WORKSPACE</button>
+        <button type="button" onClick={() => runTask("smoke_test")} disabled={busy !== null}>{busy === "smoke_test" ? "RUNNING…" : "RUN SMOKE TEST"}</button>
+        <button type="button" onClick={() => runTask("project_test")} disabled={busy !== null}>{busy === "project_test" ? "RUNNING…" : "RUN PROJECT TESTS"}</button>
+        <button type="button" className="bec-primary-action" onClick={runCompleteVerification} disabled={busy !== null}>{busy === "verification" ? "VERIFYING…" : "RUN COMPLETE ENGINEERING VERIFICATION"}</button>
+        <button type="button" onClick={() => runTask("dataset_prepare")} disabled={busy !== null}>{busy === "dataset_prepare" ? "CHECKING…" : "PREPARE DATASET"}</button>
+        <button type="button" onClick={() => runTask("baseline_evaluate")} disabled={busy !== null || results?.dataset?.status !== "READY"}>EVALUATE BASELINE</button>
+        <button type="button" onClick={() => runTask("train_model")} disabled={busy !== null || results?.dataset?.status !== "READY"}>RUN PROPOSED TRAINING</button>
+        <button type="button" onClick={() => runTask("evaluate_model")} disabled={busy !== null || results?.training?.status !== "EXECUTED"}>EVALUATE PROPOSED</button>
+        <button type="button" onClick={() => runTask("experiment_run")} disabled={busy !== null || results?.dataset?.status !== "READY"}>{busy === "experiment_run" ? "RUNNING…" : "RUN FULL EXPERIMENT"}</button>
       </>}
     </div>
     {error && <div className="bec-error">{error}</div>}
-    {build && <div className="bec-workspace"><div><strong>PROJECT PROFILE</strong><span>{build.profile}</span></div><div><strong>FILES GENERATED</strong><span>{build.files?.length || 0}</span></div><div><strong>WORKSPACE</strong><span>{build.workspace}</span></div></div>}
+    {notice && <div className="bec-notice">{notice}</div>}
+    {build && <div className="bec-workspace"><div><strong>PROJECT PROFILE</strong><span>{humanizeKey(String(build.profile || "general_ai"))}</span></div><div><strong>FILES GENERATED</strong><span>{build.files?.length || 0}</span></div><div><strong>WORKSPACE</strong><span>{build.workspace}</span></div></div>}
+
+    {workspaceOpen && <div className="bec-workspace-modal" role="dialog" aria-modal="true" aria-label="AURA project workspace">
+      <div className="bec-workspace-modal-inner">
+        <div className="bec-workspace-modal-head"><div><span className="aci-section-title">REAL PROJECT WORKSPACE</span><h4>{build?.workspace || "AURA workspace"}</h4></div><button type="button" onClick={() => { setWorkspaceOpen(false); setWorkspaceFile(null); }}>CLOSE</button></div>
+        <div className="bec-workspace-browser">
+          <div className="bec-file-list">{workspaceFiles.map((file) => <button type="button" key={file} className={workspaceFile === file ? "active" : ""} onClick={() => openWorkspaceFile(file)}>{file}</button>)}</div>
+          <pre className="bec-file-content">{workspaceFile ? workspaceContent : "Select a generated workspace file to inspect it."}</pre>
+        </div>
+      </div>
+    </div>}
 
     <div className="bec-results-panel">
-      <div className="bec-results-head"><div><span className="aci-section-title">AURA RESULTS OBSERVATORY</span><h4>Measured project results — never inferred.</h4></div><span className={`bec-results-status ${status.toLowerCase()}`}>{status.replaceAll("_", " ")}</span></div>
+      <div className="bec-results-head"><div><span className="aci-section-title">AURA RESULTS OBSERVATORY</span><h4>Measured project results — never inferred.</h4></div><span className={`bec-results-status ${status.toLowerCase()}`}>{status.split("_").join(" ")}</span></div>
       <div className="bec-results-truth">{hasMeasured ? "REAL METRICS CAPTURED FROM CONTROLLED EVALUATION — REVIEW REQUIRED" : "NO MEASURED PERFORMANCE RESULT YET — AURA WILL NOT FABRICATE ONE"}</div>
       <div className="bec-result-grid">
-        <div className="bec-result-card"><span>DATASET</span><strong>{results?.dataset?.status || "NOT AVAILABLE"}</strong><small>{results?.dataset?.image_files_found ?? 0} image files detected</small></div>
-        <div className="bec-result-card"><span>BASELINE</span><strong>{results?.baseline_executed ? "EXECUTED" : "NOT EXECUTED"}</strong><small>{results?.baseline_executed ? "Measured baseline available" : "Provide approved models/baseline.pt"}</small></div>
-        <div className="bec-result-card"><span>PROPOSED</span><strong>{results?.proposed_executed ? "EVALUATED" : "NOT EVALUATED"}</strong><small>{results?.proposed_executed ? "Measured proposed metrics available" : "Train and evaluate the proposed model"}</small></div>
+        <div className="bec-result-card"><span>DATASET</span><strong>{results?.dataset?.status || "NOT AVAILABLE"}</strong><small>{results?.dataset?.rows !== undefined ? `${results?.dataset?.rows ?? 0} rows detected` : `${results?.dataset?.files_found ?? 0} files detected`}</small></div>
+        <div className="bec-result-card"><span>BASELINE</span><strong>{results?.baseline_executed ? "EXECUTED" : "NOT EXECUTED"}</strong><small>{results?.baseline_executed ? "Measured baseline available" : "Run the project-approved baseline evaluation"}</small></div>
+        <div className="bec-result-card"><span>PROPOSED</span><strong>{results?.proposed_executed ? "EVALUATED" : "NOT EVALUATED"}</strong><small>{results?.proposed_executed ? "Measured proposed metrics available" : "Run the project-approved proposed evaluation"}</small></div>
         <div className="bec-result-card"><span>VALIDATION</span><strong>REVIEW REQUIRED</strong><small>AURA does not self-certify scientific validity</small></div>
       </div>
       <div className="bec-metric-table">
@@ -4981,7 +5700,7 @@ function BuildExecutionCenter({ project }: { project: Project | null }) {
           const b = row?.baseline ?? baseline?.[metric];
           const pr = row?.proposed ?? proposed?.[metric];
           const delta = row?.delta;
-          return <div className="bec-metric-row" key={metric}><span>{metric.replaceAll("_", " ").toUpperCase()}</span><span>{typeof b === "number" ? b.toFixed(4) : "—"}</span><span>{typeof pr === "number" ? pr.toFixed(4) : "—"}</span><span>{typeof delta === "number" ? `${delta >= 0 ? "+" : ""}${delta.toFixed(4)}` : "—"}</span></div>;
+          return <div className="bec-metric-row" key={metric}><span>{metric.split("_").join(" ").toUpperCase()}</span><span>{typeof b === "number" ? b.toFixed(4) : "—"}</span><span>{typeof pr === "number" ? pr.toFixed(4) : "—"}</span><span>{typeof delta === "number" ? `${delta >= 0 ? "+" : ""}${delta.toFixed(4)}` : "—"}</span></div>;
         })}
       </div>
     </div>
@@ -5001,6 +5720,15 @@ function DeliveryStudio({ project }: { project: Project | null }) {
   );
   const [generatingFile, setGeneratingFile] = useState<string | null>(null);
   const [generationError, setGenerationError] = useState("");
+  const [completeReport, setCompleteReport] = useState<any>(null);
+
+  useEffect(() => {
+    if (!project?.project_id) { setCompleteReport(null); return; }
+    auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/report/complete`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => setCompleteReport(d?.report || null))
+      .catch(() => setCompleteReport(null));
+  }, [project?.project_id]);
 
   const delivery = isRecord(project?.deliverables) ? project.deliverables : {};
   const evidence = Array.isArray(project?.evidence) ? project.evidence : [];
@@ -5030,23 +5758,35 @@ function DeliveryStudio({ project }: { project: Project | null }) {
     : {};
   const truthStatus = getProjectTruthStatus(project);
 
-  const outputCards = [
+  type OutputSection = [string, unknown];
+  type OutputCard = {
+    id: string;
+    title: string;
+    subtitle: string;
+    state: string;
+    icon: string;
+    sections: OutputSection[];
+  };
+
+  const outputCards: OutputCard[] = [
     {
       id: "report",
-      title: "PROJECT REPORT",
-      subtitle: "Structured technical documentation",
-      state: "CONTENT READY",
+      title: "COMPLETE PROJECT REPORT",
+      subtitle: "14-chapter end-to-end technical report",
+      state: completeReport?.truth_status === "SCIENTIFICALLY_COMPLETE" ? "SCIENTIFICALLY COMPLETE" : "GATED / PROJECT IN PROGRESS",
       icon: "▤",
-      sections: [
-        ["PROJECT", project?.original_idea || "Project idea"],
-        ["PROBLEM UNDERSTANDING", project?.analysis?.problem_understanding || project?.analysis || {}],
-        ["RESEARCH", project?.research || {}],
-        ["SOLUTION", project?.solution || {}],
-        ["ARCHITECTURE", project?.architecture || {}],
-        ["DEVELOPMENT", project?.development || {}],
-        ["EXPERIMENTS", project?.experiments || {}],
-        ["VALIDATION", project?.validation || {}],
-      ],
+      sections: completeReport?.chapters?.length
+        ? completeReport.chapters.map((chapter: any) => [`CHAPTER ${chapter.number}: ${chapter.title}`, chapter.sections || []])
+        : [
+            ["PROJECT", project?.original_idea || "Project idea"],
+            ["PROBLEM UNDERSTANDING", project?.analysis?.problem_understanding || project?.analysis || {}],
+            ["RESEARCH", project?.research || {}],
+            ["SOLUTION", project?.solution || {}],
+            ["ARCHITECTURE", project?.architecture || {}],
+            ["DEVELOPMENT", project?.development || {}],
+            ["EXPERIMENTS", project?.experiments || {}],
+            ["VALIDATION", project?.validation || {}],
+          ],
     },
     {
       id: "paper",
@@ -5114,6 +5854,46 @@ function DeliveryStudio({ project }: { project: Project | null }) {
         ["STEP 05 — VALIDATION", project?.experiments || project?.validation || {}],
         ["IMPORTANT", "A live demonstration is not scientific proof. Quantitative claims require executed experiments."],
       ],
+    },
+    {
+      id: "dataset_report",
+      title: "DATASET REPORT",
+      subtitle: "Dataset inventory, quality and provenance",
+      state: "GATED BY REAL DATA",
+      icon: "◫",
+      sections: [["DATASET", completeReport?.datasets || "Upload the real project dataset to populate this report."], ["TRUTH", "Dataset profiling is not scientific validation."]],
+    },
+    {
+      id: "results_report",
+      title: "RESULTS REPORT",
+      subtitle: "Measured baseline vs proposed results",
+      state: completeReport?.results?.proposed_executed ? "MEASURED / REVIEW REQUIRED" : "NOT EXECUTED",
+      icon: "▥",
+      sections: [["RESULTS", completeReport?.results || "No measured results yet."], ["TRUTH", "Metrics are included only when produced by controlled execution."]],
+    },
+    {
+      id: "experiment_report",
+      title: "EXPERIMENT REPORT",
+      subtitle: "Hypothesis, baseline, proposed model and reproducibility",
+      state: "EXECUTION DEPENDENT",
+      icon: "∿",
+      sections: [["EXPERIMENT", completeReport?.results?.experiment || project?.experiments || {}]],
+    },
+    {
+      id: "traceability_report",
+      title: "TRACEABILITY REPORT",
+      subtitle: "Evidence → claims → execution → validation",
+      state: "PROVENANCE",
+      icon: "⌬",
+      sections: [["LIFECYCLE", completeReport?.lifecycle || {}], ["EVIDENCE", project?.evidence || []], ["COMPLETION", completeReport?.completion || {}]],
+    },
+    {
+      id: "completion_report",
+      title: "COMPLETION REPORT",
+      subtitle: "Final gates and scientific completion certificate",
+      state: completeReport?.scientific_completion ? "COMPLETE" : "GATES REMAIN",
+      icon: "✓",
+      sections: [["COMPLETION", completeReport?.completion || project?.completion || {}], ["TRUTH STATUS", completeReport?.truth_status || "DESIGNED_OR_IN_PROGRESS"]],
     },
     {
       id: "viva",
@@ -5187,7 +5967,7 @@ function DeliveryStudio({ project }: { project: Project | null }) {
     try {
       // The backend persists projects, but this sync also restores a browser-saved
       // project after a backend restart before any file is generated.
-      const syncResponse = await fetch(`${API_BASE}/api/aura/projects/${project.project_id}/snapshot`, {
+      const syncResponse = await auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/snapshot`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(project),
@@ -5223,10 +6003,15 @@ function DeliveryStudio({ project }: { project: Project | null }) {
   }
 
   const fileStates = [
-    { key: "docx", label: "DOCX PROJECT REPORT", icon: "▤" },
-    { key: "pdf", label: "PDF PROJECT REPORT", icon: "▧" },
-    { key: "pptx", label: "PPTX PRESENTATION", icon: "▥" },
-    { key: "zip", label: "PROJECT PACKAGE", icon: "◫" },
+    { key: "docx", label: "COMPLETE REPORT · DOCX", icon: "▤" },
+    { key: "pdf", label: "COMPLETE REPORT · PDF", icon: "▧" },
+    { key: "pptx", label: "PRESENTATION · PPTX", icon: "▥" },
+    { key: "dataset_report", label: "DATASET REPORT", icon: "◫" },
+    { key: "results_report", label: "RESULTS REPORT", icon: "▥" },
+    { key: "experiment_report", label: "EXPERIMENT REPORT", icon: "∿" },
+    { key: "traceability_report", label: "TRACEABILITY REPORT", icon: "⌬" },
+    { key: "completion_report", label: "COMPLETION REPORT", icon: "✓" },
+    { key: "zip", label: "COMPLETE PROJECT PACKAGE", icon: "◈" },
   ];
 
   const fileReadyCount = fileStates.filter((item) => generatedFiles[item.key] === true || actualFiles[item.key] === true).length;
@@ -5267,7 +6052,7 @@ function DeliveryStudio({ project }: { project: Project | null }) {
             <div><span>MEMORY</span><strong>{memory.length}</strong><small>events</small></div>
           </div>
           <div className="delivery-output-grid">
-            {outputCards.slice(0, 4).map((card) => (
+            {outputCards.slice(0, 6).map((card) => (
               <button key={card.id} type="button" className="delivery-output-card" onClick={() => openOutput(card.id)}>
                 <span className="delivery-output-icon">{card.icon}</span>
                 <span className="delivery-output-title">{card.title}</span>
@@ -5318,7 +6103,8 @@ function DeliveryStudio({ project }: { project: Project | null }) {
                 {selected.id === "report" && <button type="button" onClick={() => generateFile("docx")} disabled={generatingFile !== null}>{generatingFile === "docx" ? "GENERATING…" : "GENERATE DOCX"}</button>}
                 {selected.id === "report" && <button type="button" onClick={() => generateFile("pdf")} disabled={generatingFile !== null}>{generatingFile === "pdf" ? "GENERATING…" : "GENERATE PDF"}</button>}
                 {selected.id === "presentation" && <button type="button" onClick={() => generateFile("pptx")} disabled={generatingFile !== null}>{generatingFile === "pptx" ? "GENERATING…" : "GENERATE PPTX"}</button>}
-                <button type="button" onClick={() => generateFile("zip")} disabled={generatingFile !== null}>{generatingFile === "zip" ? "PACKAGING…" : "GENERATE PROJECT ZIP"}</button>
+                {["dataset_report","results_report","experiment_report","traceability_report","completion_report"].includes(selected.id) && <button type="button" onClick={() => generateFile(selected.id)} disabled={generatingFile !== null}>{generatingFile === selected.id ? "GENERATING…" : "GENERATE REPORT FILE"}</button>}
+                <button type="button" onClick={() => generateFile("zip")} disabled={generatingFile !== null}>{generatingFile === "zip" ? "PACKAGING…" : "GENERATE COMPLETE PROJECT ZIP"}</button>
                 <span>Files are generated from the current AURA project state. Generated files are not scientific verification of unexecuted experiments.</span>
               </div>
             </div>
@@ -5388,6 +6174,215 @@ function DeliveryStudio({ project }: { project: Project | null }) {
   );
 }
 
+
+function ProjectLifecycle({ project }: { project: Project | null }) {
+  const lifecycle = project?.lifecycle;
+  const stages = Array.isArray(lifecycle?.stages) ? lifecycle.stages : [];
+  if (!project || stages.length === 0) return null;
+  const percent = Number(lifecycle?.completion_percent || 0);
+  const verified = Number(lifecycle?.verified_stages || 0);
+  const total = Number(lifecycle?.total_stages || stages.length);
+  const blocker = lifecycle?.next_blocker;
+  return (
+    <div className="project-lifecycle-panel">
+      <div className="project-lifecycle-head">
+        <div>
+          <span className="project-lifecycle-kicker">PROJECT DEVELOPMENT LIFECYCLE</span>
+          <h3>{lifecycle?.completed ? "PROJECT COMPLETED" : "LIVE PROJECT COMPLETION"}</h3>
+          <p>Project-specific development stages generated from the detected project profile. Design, execution, measurement and scientific validation remain separate states.</p>
+        </div>
+        <div className="lifecycle-score"><strong>{percent}%</strong><span>VERIFIED</span></div>
+      </div>
+      <div className="lifecycle-progress"><i style={{ width: `${percent}%` }} /></div>
+      <div className="lifecycle-summary"><b>{verified} / {total} VERIFIED STAGES</b><span>PROFILE · {(lifecycle?.profile || "general").replaceAll("_", " ").toUpperCase()}</span></div>
+      <div className="lifecycle-track" role="list" aria-label="Project development lifecycle">
+        {stages.map((stage) => (
+          <div key={stage.key} className={`lifecycle-node lifecycle-${stage.status}`} role="listitem" title={stage.reason}>
+            <div className="lifecycle-dot">{stage.verified ? "✓" : stage.status === "review" ? "!" : stage.status === "blocked" ? "×" : stage.status === "na" ? "–" : "○"}</div>
+            <span>{stage.label}</span>
+            <small>{stage.display}</small>
+          </div>
+        ))}
+      </div>
+      <div className={`lifecycle-blocker ${blocker ? "has-blocker" : "clear"}`}>
+        <span>{blocker ? "NEXT REQUIRED ACTION" : "LIFECYCLE CLEAR"}</span>
+        <strong>{blocker ? `${blocker.label}: ${blocker.display}` : "All project lifecycle stages are verified."}</strong>
+        <small>{blocker?.reason || lifecycle?.truth}</small>
+      </div>
+    </div>
+  );
+}
+
+
+function AuraProjectStatusLayer({ project, pipeline }: { project: Project | null; pipeline: Pipeline | null }) {
+  if (!project) return null;
+  const truth = getTruthStatus(project);
+  const validation = isRecord(project.validation) ? project.validation : {};
+  const experiments = isRecord(project.experiments) ? project.experiments : {};
+  const results = isRecord(experiments.results_summary) ? experiments.results_summary : {};
+  const evidence = Array.isArray(project.evidence) ? project.evidence : [];
+  const research = isRecord(project.research) ? project.research : {};
+  const researchRecords = Array.isArray(research.sources) ? research.sources.length : Array.isArray(research.papers) ? research.papers.length : 0;
+  const executed = ["RESULTS_AVAILABLE_REVIEW_REQUIRED", "EXPERIMENT_EXECUTED_REVIEW_REQUIRED", "EXECUTED"].includes(safeText(results.status).toUpperCase()) || safeText(validation.execution_status).toUpperCase() === "EXECUTED";
+  const measured = Boolean(results && Object.keys(results).some((k) => ["precision","recall","accuracy","f1","map50","map50_95","mae","rmse","r2"].includes(k.toLowerCase()) && results[k] !== null && results[k] !== undefined));
+  const validated = truth.label === "VALIDATED";
+  const workflow = pipeline ? "CONFIGURED" : "READY";
+  const steps = [
+    ["DESIGNED", "COMPLETE", "good"],
+    ["RESEARCH", researchRecords ? `${researchRecords} RECORDS` : "EVIDENCE REQUIRED", researchRecords ? "good" : "warn"],
+    ["IMPLEMENTATION", "READY", "ready"],
+    ["EXECUTION", executed ? "RECORDED" : "NOT EXECUTED", executed ? "good" : "blocked"],
+    ["MEASUREMENT", measured ? "MEASURED" : "PENDING", measured ? "good" : "blocked"],
+    ["VALIDATION", validated ? "VERIFIED" : "PENDING REVIEW", validated ? "good" : "warn"],
+    ["DELIVERY", validated ? "READY" : "PENDING", validated ? "good" : "blocked"],
+  ];
+  return <section className="aura-project-status-layer" aria-label="AURA project status and truth">
+    <div className="aps-head">
+      <div><span>AURA PROJECT STATUS</span><h3>One truth layer for the entire project</h3><p>Workflow configuration, evidence, execution, measurement and scientific validation are tracked separately.</p></div>
+      <div className={`aps-truth ${truth.tone}`}>{truth.label}</div>
+    </div>
+    <div className="aps-grid">
+      {steps.map(([name, state, tone]) => <div className={`aps-card ${tone}`} key={name}><span>{name}</span><strong>{state}</strong></div>)}
+    </div>
+    <div className="aps-footer"><div><b>WORKFLOW</b><span>{workflow} · {STAGES.length}/{STAGES.length} stages available</span></div><div><b>EVIDENCE</b><span>{evidence.length} records · reviewed separately</span></div><div><b>SCIENTIFIC TRUTH</b><span>{truth.detail}</span></div></div>
+  </section>;
+}
+
+function PlatformCompletionPanel() {
+  const [cert, setCert] = useState<any>(null);
+  useEffect(() => {
+    auraFetch(`${API_BASE}/api/aura/platform/certification`, { cache: "no-store" })
+      .then((r) => r.json()).then((d) => setCert(d?.certification || null)).catch(() => undefined);
+  }, []);
+  if (!cert) return null;
+  const checks = isRecord(cert.checks) ? Object.entries(cert.checks) : [];
+  return <section className="platform-completion-panel">
+    <div className="platform-completion-head">
+      <div><span>AURA PLATFORM CERTIFICATION</span><h3>{cert.certification === "PLATFORM_COMPLETE" ? "100% PLATFORM COMPLETE" : "PLATFORM VERIFICATION REQUIRED"}</h3><p>All core AURA software capabilities are represented in the release. Scientific project completion remains governed by real evidence and human validation.</p></div>
+      <div className="platform-completion-score"><strong>{cert.percent}%</strong><small>{cert.passed}/{cert.total} CHECKS</small></div>
+    </div>
+    <div className="platform-completion-bar"><i style={{width:`${cert.percent}%`}} /></div>
+    <div className="platform-check-grid">{checks.map(([key,value]) => <div key={key} className={value ? "platform-check pass" : "platform-check fail"}><b>{value ? "✓" : "×"}</b><span>{key.replaceAll("_"," ").toUpperCase()}</span></div>)}</div>
+  </section>;
+}
+
+function ProjectHealthPanel({ project }: { project: Project | null }) {
+  const [health, setHealth] = useState<any>(null);
+  useEffect(() => {
+    if (!project?.project_id) return;
+    auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/health-score`, { cache: "no-store" })
+      .then((r) => r.json()).then((d) => { if (d?.health) setHealth(d.health); }).catch(() => undefined);
+  }, [project?.project_id, project?.lifecycle?.completion_percent]);
+  if (!project || !health) return null;
+  const components = isRecord(health.components) ? health.components : {};
+  return (
+    <div className="project-health-panel">
+      <div className="project-health-head">
+        <div><span className="project-health-kicker">AURA PROJECT HEALTH</span><h3>{health.grade} · {health.score}/100</h3><p>Engineering readiness signal across lifecycle, execution, research, evidence, testing and review. This is not a scientific validity score.</p></div>
+        <div className="project-health-score"><strong>{health.score}</strong><span>HEALTH</span></div>
+      </div>
+      <div className="project-health-bars">
+        {Object.entries(components).map(([key, value]) => <div className="project-health-row" key={key}><span>{humanizeKey(key)}</span><i><b style={{ width: `${Math.min(100, Number(value) * 2)}%` }} /></i><strong>{String(value)}</strong></div>)}
+      </div>
+      <div className="project-health-foot"><span>{health.executions} successful executions</span><span>{health.failures} failures / blocks</span><span>{health.scientific_validation ? "SCIENTIFIC REVIEWED" : "SCIENTIFIC REVIEW PENDING"}</span></div>
+    </div>
+  );
+}
+
+function DependencyImpactPanel({ project }: { project: Project | null }) {
+  const [impact, setImpact] = useState<any>(null);
+  const [loading, setLoading] = useState(false);
+  async function refresh() {
+    if (!project?.project_id) return;
+    setLoading(true);
+    try {
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/dependency-impact`, { cache: "no-store" });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok) setImpact(d.impact || null);
+    } finally { setLoading(false); }
+  }
+  useEffect(() => { void refresh(); }, [project?.project_id]);
+  if (!project) return null;
+  const changed = Array.isArray(impact?.changed_nodes) ? impact.changed_nodes : [];
+  const affected = Array.isArray(impact?.impacted_nodes) ? impact.impacted_nodes : [];
+  return <section className="dependency-impact-panel">
+    <div className="dip-head">
+      <div><span>DEPENDENCY & IMPACT INTELLIGENCE</span><h3>{changed.length ? "DOWNSTREAM IMPACT DETECTED" : "PROJECT DEPENDENCIES STABLE"}</h3><p>AURA tracks upstream changes and identifies downstream work that may require re-checking, re-execution or re-validation.</p></div>
+      <button type="button" onClick={refresh} disabled={loading}>{loading ? "SCANNING…" : "SCAN IMPACT"}</button>
+    </div>
+    <div className="dip-stats"><div><b>{changed.length}</b><span>CHANGED NODES</span></div><div><b>{affected.length}</b><span>IMPACTED NODES</span></div><div><b>{impact?.requires_reexecution ? "YES" : "NO"}</b><span>RE-EXECUTION</span></div><div><b>{impact?.requires_revalidation ? "YES" : "NO"}</b><span>RE-VALIDATION</span></div></div>
+    {changed.length > 0 ? <div className="dip-flow">{changed.map((node:string) => <div key={node}><strong>{node.replaceAll("_", " ").toUpperCase()}</strong><span>CHANGED</span></div>)}<i>→</i><div className="dip-affected"><strong>{affected.length} DOWNSTREAM</strong><span>{affected.slice(0, 7).map((node:string) => node.replaceAll("_", " ")).join(" · ")}{affected.length > 7 ? " · …" : ""}</span></div></div> : <div className="dip-clear">No persisted upstream change is currently propagating through the project dependency graph.</div>}
+    <small className="dip-truth">{impact?.truth || "Impact propagation identifies stale downstream work; it does not itself prove scientific invalidity."}</small>
+  </section>;
+}
+
+
+function ResultsObservatoryPanel({ project }: { project: Project | null }) {
+  const [data, setData] = useState<any>(null); const [loading, setLoading] = useState(false);
+  async function refresh(){ if(!project?.project_id)return; setLoading(true); try{const r=await auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/results/observatory`,{cache:"no-store"}); const d=await r.json().catch(()=>({})); if(r.ok)setData(d.observatory||null);}finally{setLoading(false);} }
+  useEffect(()=>{void refresh();},[project?.project_id]); if(!project)return null;
+  const metrics=Array.isArray(data?.metrics)?data.metrics:[], artifacts=Array.isArray(data?.artifacts)?data.artifacts:[], lineage=Array.isArray(data?.execution_lineage)?data.execution_lineage:[];
+  const repro=isRecord(data?.reproducibility)?data.reproducibility:{};
+  return <section className="results-observatory-panel"><div className="rop-head"><div><span>RESULTS OBSERVATORY</span><h3>Measured results, provenance & reproducibility</h3><p>Every metric is tied to persisted execution artifacts. Measurement remains separate from scientific validation.</p></div><button type="button" onClick={refresh} disabled={loading}>{loading?"REFRESHING…":"REFRESH RESULTS"}</button></div>
+    <div className="rop-stats"><div><b>{metrics.filter((m:any)=>m.measured).length}</b><span>MEASURED METRICS</span></div><div><b>{artifacts.length}</b><span>HASHED ARTIFACTS</span></div><div><b>{lineage.length}</b><span>EXECUTED RUNS</span></div><div><b>{repro.reproducible_ready?"READY":"PENDING"}</b><span>REPRODUCIBILITY</span></div></div>
+    {metrics.length?<div className="rop-metrics">{metrics.map((m:any)=><div className="rop-metric" key={m.metric}><b>{String(m.metric).replaceAll("_"," ").toUpperCase()}</b><small>{m.source}</small><strong>{m.proposed??"—"}</strong><span>{m.baseline!=null?`BASELINE ${m.baseline} · Δ ${m.delta??"—"}`:"NO BASELINE RECORDED"}</span></div>)}</div>:<div className="rop-empty">No measured metrics are currently available from persisted execution artifacts.</div>}
+    <div className="rop-lineage"><div><b>EXECUTION LINEAGE</b><span>{lineage.length?lineage.slice(0,4).map((e:any)=>`${e.task||"run"} · ${e.execution_id||"unknown"}`).join(" | "):"No successful execution lineage recorded."}</span></div><div><b>RESULT STATUS</b><span>{data?.review_status||"REVIEW_REQUIRED"}</span></div></div><small className="rop-truth">{data?.truth||"Measured results require the validation gate and authorized human review before scientific validation."}</small>
+  </section>;
+}
+
+function ReproducibilityLineagePanel({ project }: { project: Project | null }) {
+  const [data,setData]=useState<any>(null); const [loading,setLoading]=useState(false);
+  async function refresh(){ if(!project?.project_id)return; setLoading(true); try{const r=await auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/reproducibility/lineage`,{cache:"no-store"}); const d=await r.json().catch(()=>({})); if(r.ok)setData(d.lineage||null);}finally{setLoading(false);} }
+  useEffect(()=>{void refresh();},[project?.project_id]); if(!project)return null;
+  const files=Array.isArray(data?.tracked_files)?data.tracked_files:[], runs=Array.isArray(data?.executions)?data.executions:[];
+  return <section className="repro-lineage-panel"><div className="rlp-head"><div><span>REPRODUCIBILITY & EXPERIMENT LINEAGE</span><h3>Can the recorded result be reproduced?</h3><p>Configuration, execution order, environment and artifact hashes are kept together as a reproducibility record.</p></div><button type="button" onClick={refresh} disabled={loading}>{loading?"CHECKING…":"CHECK REPRODUCIBILITY"}</button></div>
+    <div className="rlp-stats"><div><b>{data?.reproducible_ready?"READY":"INCOMPLETE"}</b><span>REPRODUCTION STATE</span></div><div><b>{runs.length}</b><span>EXECUTION STEPS</span></div><div><b>{files.length}</b><span>TRACKED ARTIFACTS</span></div><div><b>{data?.requirements?.seed??"—"}</b><span>RECORDED SEED</span></div></div>
+    <div className="rlp-flow">{runs.slice(0,6).map((r:any,i:number)=><div key={r.execution_id||i}><strong>{i+1}. {String(r.task||"execution").replaceAll("_"," ")}</strong><span>{r.execution_id||"NO ID"} · {r.artifact_count||0} artifacts</span></div>)}</div>
+    <small className="rlp-truth">{data?.truth_boundary||"Reproducibility documentation does not establish scientific validity; validation still requires the AURA validation gate and authorized human review."}</small>
+  </section>;
+}
+
+function ValidationGate({ project }: { project: Project | null }) {
+  const [completion, setCompletion] = useState<any>(null);
+  const [gate, setGate] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  async function refresh() {
+    if (!project?.project_id) return;
+    const [completionResponse, gateResponse] = await Promise.all([
+      auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/completion`, { cache: "no-store" }),
+      auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/validation/gate`, { cache: "no-store" }),
+    ]);
+    const d = await completionResponse.json().catch(() => ({}));
+    const g = await gateResponse.json().catch(() => ({}));
+    if (completionResponse.ok) setCompletion(d.completion);
+    if (gateResponse.ok) setGate(g.gate);
+  }
+  useEffect(() => { void refresh(); }, [project?.project_id]);
+  async function approve() {
+    if (!project?.project_id) return;
+    setBusy(true); setMessage("");
+    try {
+      const session = JSON.parse(window.localStorage.getItem("aura_session") || "{}");
+      if (!session.token) throw new Error("Sign in with an AURA account before approving validation.");
+      const r = await auraFetch(`${API_BASE}/api/aura/projects/${project.project_id}/validation/review`, { method:"POST", headers:{"Content-Type":"application/json","Authorization":`Bearer ${session.token}`}, body:JSON.stringify({approved:true, reviewer_note:"Human review completed in AURA."}) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detail || "Validation approval was blocked.");
+      setCompletion(d.completion);
+      await refresh();
+      setMessage("VALIDATION APPROVED — completion state recalculated.");
+    } catch (e) { setMessage(e instanceof Error ? e.message : "Validation review failed."); } finally { setBusy(false); }
+  }
+  const gates = Array.isArray(completion?.gates) ? completion.gates : [];
+  return <section className="validation-gate-panel">
+    <div className="validation-gate-head"><div><span className="aci-section-title">COMPLETION & VALIDATION GATE</span><h3>{completion?.status || "CHECKING…"}</h3><p>AURA cannot self-certify scientific validity. Every required gate must pass, measured evidence must exist, and a human reviewer must approve validation.</p></div><button type="button" onClick={refresh}>REFRESH</button></div>
+    <div className="validation-gate-grid">{gates.map((g:any)=><div key={g.gate} className={g.passed ? "passed" : "blocked"}><span>{g.passed ? "✓" : "○"}</span><b>{String(g.gate).replaceAll("_"," ").toUpperCase()}</b><small>{g.passed ? "PASSED" : "REQUIRED"}</small></div>)}</div>
+    {Array.isArray(gate?.criteria) && <div className="validation-gate-criteria">{gate.criteria.map((c:any)=><div key={c.id} className={c.passed ? "passed" : "blocked"}><span>{c.passed ? "✓" : "!"}</span><div><b>{c.label}</b><small>{c.reason}</small></div></div>)}</div>}
+    <div className="validation-gate-actions"><strong>{gate ? `${gate.required_passed}/${gate.required_total} REQUIRED CRITERIA` : `${completion?.completion_percent ?? 0}% GATES PASSED`}</strong><button type="button" disabled={busy || completion?.completed || !gate?.ready} onClick={approve}>{busy ? "REVIEWING…" : "APPROVE SCIENTIFIC VALIDATION"}</button></div>
+    {message && <div className="validation-gate-message">{message}</div>}
+  </section>;
+}
+
 function StagePanel({
   stage,
   project,
@@ -5413,12 +6408,8 @@ function StagePanel({
     project?.original_idea ||
     "AURA project context is loading.";
 
-  const completedBefore = Math.max(index, 0);
-
-  const remaining = Math.max(
-    STAGES.length - index - 1,
-    0
-  );
+  const connectedBefore = Math.max(index, 0);
+  const remainingGates = Math.max(STAGES.length - STAGES.map((item, itemIndex) => getStageState(item, itemIndex, null, project)).filter((item) => ["COMPLETED", "EXECUTED", "VERIFIED"].includes(item.label)).length, 0);
 
   const status =
     project?.status ||
@@ -5454,6 +6445,7 @@ function StagePanel({
         <AuraCommandCenter stage={stage} project={project} />
 
         {stage === "build" && <BuildExecutionCenter project={project} />}
+        {stage === "validate" && <ValidationGate project={project} />}
 
         {stage === "deliver" && <BuildExecutionCenter project={project} />}
         {stage === "deliver" && <DeliveryStudio project={project} />}
@@ -5594,21 +6586,21 @@ function StagePanel({
 
         <div className="connected-count">
           <strong>
-            {completedBefore}
+            {connectedBefore}
           </strong>
 
           <span>
-            PREVIOUS STAGES CONNECTED
+            PIPELINE STAGES CONNECTED
           </span>
         </div>
 
         <div className="connected-count">
           <strong>
-            {remaining}
+            {remainingGates}
           </strong>
 
           <span>
-            STAGES REMAINING
+            VERIFICATION GATES REMAINING
           </span>
         </div>
 
@@ -5771,7 +6763,7 @@ function MemoryPanel({
     ? project.memory
     : [];
 
-  const stageCounts = memory.reduce(
+  const stageCounts = memory.reduce<Record<string, number>>(
     (acc, item) => {
       if (!isRecord(item)) return acc;
 
